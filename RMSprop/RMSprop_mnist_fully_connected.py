@@ -29,9 +29,7 @@ from simplelearn.io import SerializableModel
 from simplelearn.data.dataset import Dataset
 from simplelearn.data.mnist import load_mnist
 from simplelearn.formats import DenseFormat
-from simplelearn.training import (SgdParameterUpdater,
-                                  Sgd,
-                                  LogsToLists,
+from simplelearn.training import (LogsToLists,
                                   SavesAtMinimum,
                                   Monitor,
                                   AverageMonitor,
@@ -41,6 +39,7 @@ from simplelearn.training import (SgdParameterUpdater,
                                   ValidationCallback,
                                   StopsOnStagnation)
 import pdb
+from RMSprop_extensions import RMSpropSgd, RMSpropSgdParameterUpdater
 
 
 def parse_args():
@@ -428,7 +427,7 @@ def main():
                        affine_node.bias_node.params):
             parameters.append(params)
             gradients = theano.gradient.grad(loss_sum, params)
-            parameter_updater = SgdParameterUpdater(params,
+            parameter_updater = RMSpropSgdParameterUpdater(params,
                                                     gradients,
                                                     args.learning_rate,
                                                     args.initial_momentum,
@@ -511,7 +510,7 @@ def main():
         input_iterator=mnist_validation_iterator,
         monitors=[validation_loss_monitor, mcr_monitor])
 
-    trainer = Sgd([image_uint8_node, label_node],
+    trainer = RMSpropSgd([image_uint8_node, label_node],
                   mnist_training.iterator(iterator_type='sequential',
                                           batch_size=args.batch_size),
                   parameters,

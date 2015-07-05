@@ -1,7 +1,3 @@
-"""
-Training algorithms, and callbacks for monitoring their progress.
-"""
-
 import os
 import copy
 import warnings
@@ -33,18 +29,64 @@ from simplelearn.nodes import Node
 import pdb
 
 
+class RMSpropSgdParameterUpdater(object):
+    '''
+    Defines how to update parameters using SGD with momentum.
 
-class SemiSgdParameterUpdater(object):
+    You can set the learning rate and momentum dynamically during the
+    optimization.
+
+    Fields
+    ------
+    learning_rate: theano.tensor.SharedScalarVariable
+      Call set_value() on this to change the learning rate.
+
+    momentum:  theano.tensor.SharedScalarVariable
+      Call set_value() on this to change the momentum.
+
+    updates: dict
+      A dictionary with (var: new_var) pairs, where var and new_var are
+      Theano expressions. At each training update, var's value will be
+      replaced with new_var.
+
+      This contains the update for not just a parameter, but also the internal
+      state, such as the as the momentum-averaged update direction.
+    '''
 
     def __init__(self,
                  parameter,
-                 gradient,
-                 gradient_at_old_params,
+                 gradient,  # see (*) below
                  learning_rate,
                  momentum,
-                 method,
-                 input_iterator,
                  use_nesterov):
+
+        # (*): We pass in the gradient, rather than the cost, since there are
+        # different ways to generate the gradient expression, and we want to
+        # allow the user to choose different ones, rather than generating the
+        # gradient here ourselves. In particular, the 'consider_constant'
+        # argument to theano.gradient.grad() could be of interest to the user.
+        # (It's a list of symbols to consider constant, and thus not
+        # backpropagate through.)
+        '''
+        Parameters
+        ----------
+        parameter: A theano symbol
+          A parameter being optimized by an Sgd trainer.
+
+        gradient: A theano symbol
+          The gradient of the loss function w.r.t. the above parameter.
+
+        learing_rate: float
+          The initial value of the learning rate.
+
+        momentum: float
+          A parameter affecting how smeared the update direction is over
+          multiple batches. Use 0.0 for momentum-less SGD.
+
+        use_nesterov: bool
+          If true, use Nesterov momentum. (See "Advances in Optimizing
+          Recurrent Networks", Yoshua Bengio, et al.)
+        '''
 
         #
         # sanity-check args
@@ -52,12 +94,10 @@ class SemiSgdParameterUpdater(object):
 
         assert_is_instance(parameter, theano.tensor.sharedvar.SharedVariable)
         assert_is_instance(gradient, theano.gof.Variable)
-        assert_is_instance(gradient_at_old_params, theano.gof.Variable)
         assert_equal(parameter.broadcastable, gradient.broadcastable,
                      "If an Op's .grad() method is buggy, it can return "
                      "broadcast masks.")
         assert_is_subdtype(gradient.dtype, numpy.floating)
-        assert_is_subdtype(gradient_at_old_params.dtype, numpy.floating)
         assert_greater_equal(learning_rate, 0)
         assert_greater_equal(momentum, 0)
         assert_is_instance(use_nesterov, bool)
@@ -92,38 +132,27 @@ class SemiSgdParameterUpdater(object):
         self.momentum = make_shared_floatX(momentum,
                                            concat(parameter.name, ' momentum'))
 
+        decay_rate = 0.1
+        self.decay_rate = make_shared_floatX(decay_rate,
+                                           concat(parameter.name, ' decay rate'))
+
         self._velocity = make_shared_floatX(
             0.0 * parameter.get_value(),
             concat(parameter.name, ' velocity'),
             broadcastable=parameter.broadcastable)
 
-        self.full_gradient = make_shared_floatX(
+        self.mean_square = make_shared_floatX(
             0.0 * parameter.get_value(),
-            concat(parameter.name, ' full gradient'),
+            concat(parameter.name, '  MeanSquare'),
             broadcastable=parameter.broadcastable)
 
-        # This variable takes value 1 if S2GD is used and 0 otherwise.
-        self.method = method
-        if self.method == 'SGD' or self.method == 'S2GD_plus':
-            multiplier = 0.0
-        elif self.method == 'S2GD' or self.method == 'S2GD_rolling':
-            multiplier = 1.0
-        else:
-            raise Exception('Please enter a valid method: "SGD", "S2GD", "S2GD_plus", or "S2GD_rolling"')
 
-        self.S2GD_on = make_shared_floatX(numeric_var=multiplier, name='use_S2GD')
+        new_mean_square = self.decay_rate * self.mean_square + (1-self.decay_rate) * pow(gradient,2)
+        new_mean_square.name = concat('new ', self.mean_square.name)
 
-        # updated_full_gradient = 0
-        if self.method == 'S2GD_rolling':
-            total_size_dataset = float(input_iterator.dataset.tensors[0].shape[0])
-            batch_size = float(input_iterator.batch_size)
-            updated_full_gradient = (gradient*batch_size + self.full_gradient*total_size_dataset - gradient_at_old_params*batch_size)/ total_size_dataset
-            new_velocity = self.momentum* self._velocity - self.learning_rate * updated_full_gradient
-            new_velocity.name = concat('new ', self._velocity.name)
-        else:
-            new_velocity = self.momentum* self._velocity - self.learning_rate * (gradient + self.S2GD_on * (self.full_gradient - gradient_at_old_params))
-            new_velocity.name = concat('new ', self._velocity.name)
-
+        new_velocity = (self.momentum * self._velocity -
+                        self.learning_rate * (gradient / pow(new_mean_square, 0.5) + 0.6) )
+        new_velocity.name = concat('new ', self._velocity.name)
 
         assert_equal(str(new_velocity.dtype), str(floatX))
         assert_equal(self._velocity.broadcastable, new_velocity.broadcastable)
@@ -132,36 +161,73 @@ class SemiSgdParameterUpdater(object):
                 if use_nesterov
                 else new_velocity)
 
+        step2 = self.learning_rate * (gradient / ( pow(new_mean_square, 0.5) + 0.6) )
+
         assert_equal(parameter.broadcastable,
                      step.broadcastable)
 
         new_parameter = parameter + step
         new_parameter.name = concat('new ', parameter.name)
 
-        # self.updates = 0
-        if self.method == 'S2GD_rolling':
-            self.updates = OrderedDict([(parameter, new_parameter),
-                                        (self._velocity, new_velocity),
-                                        (self.full_gradient, updated_full_gradient)])
-        else:
-            self.updates = OrderedDict([(parameter, new_parameter),
-                                        (self._velocity, new_velocity)])
+        self.updates = OrderedDict([(parameter, new_parameter),
+                                    (self._velocity, new_velocity),
+                                    (self.mean_square, new_mean_square)])
 
-class SemiSgd(object):
 
+class RMSpropSgd(object):
+
+    '''
+    Uses stochastic gradient descent to optimize a cost w.r.t. parameters.
+
+    The parameters and the inputs may be the same.
+
+    At each iteration this computes the gradients of each parameter with
+    respect to the cost function, then updates the parameter value using
+    the gradients. How this update is performed (e.g. learning rate,
+    momentum value & type, etc) is up to the SgdParameterUpdater
+    objects passed into the constructor.
+    '''
 
     def __init__(self,
-                inputs,
-                input_iterator,
-                parameters,
-                old_parameters,
-                parameter_updaters,
-                gradient,
-                monitors,
-                training_set,
-                epoch_callbacks,
-                theano_function_mode=None):
+                 inputs,
+                 input_iterator,
+                 parameters,
+                 parameter_updaters,
+                 monitors,
+                 epoch_callbacks,
+                 theano_function_mode=None):
 
+        '''
+        Parameters
+        ----------
+
+        inputs: sequence of Nodes.
+          Symbols for the outputs of the input_iterator.
+          These should come from input_iterator.make_input_nodes()
+
+        input_iterator: simplelearn.data.DataIterator
+          Yields tuples of training set batches, such as (values, labels).
+
+        parameters: sequence of theano.tensor.sharedvar.SharedVariables
+          What this trainer modifies to lower the cost. These are typically
+          model weights, though they could also be inputs (e.g. for optimizing
+          input images).
+
+        parameter_updaters: sequence of SgdParameterUpdaters
+          updaters for the corresponding elements in <parameters>.
+          These are defined using the loss function to be minimized.
+
+        monitors: (optional) sequence of Monitors.
+          These are also used as epoch callbacks.
+
+        epoch_callbacks: sequence of EpochCallbacks
+          One of these must throw a StopTraining exception for the training to
+          halt.
+
+        theano_function_mode: theano.compile.Mode
+          Optional. The 'mode' argument to pass to theano.function().
+          An example: pylearn2.devtools.nan_guard.NanGuard()
+        '''
 
         #
         # sanity-checks the arguments.
@@ -180,9 +246,14 @@ class SemiSgd(object):
             assert_equal(input.output_format, iterator_input.output_format)
 
         assert_is_instance(parameters, Sequence)
-        for parameter in parameters:
+        assert_is_instance(parameter_updaters, Sequence)
+        for parameter, updater in safe_izip(parameters, parameter_updaters):
             assert_is_instance(parameter,
                                theano.tensor.sharedvar.SharedVariable)
+
+            assert_is_instance(updater, RMSpropSgdParameterUpdater)
+
+            assert_in(parameter, updater.updates)
 
         assert_is_instance(monitors, Sequence)
         for monitor in monitors:
@@ -204,12 +275,10 @@ class SemiSgd(object):
 
         self._input_iterator = input_iterator
         self._parameters = tuple(parameters)
-        self._old_parameters = tuple(old_parameters)
         self._parameter_updaters = tuple(parameter_updaters)
         self._monitors = tuple(monitors)
 
         input_symbols = [i.output_symbol for i in inputs]
-
         self._compile_update_function_args = \
             {'input_symbols': input_symbols,
              'monitors': self._monitors,
@@ -231,14 +300,6 @@ class SemiSgd(object):
         self.epoch_callbacks = tuple(epoch_callbacks)
 
         self._train_called = False
-
-        self._training_full_gradient_iterator = training_set.iterator(iterator_type='sequential', batch_size=50000) #training_set.size
-        self.classification_errors = numpy.asarray([])
-
-        self.gradient_function = theano.function(input_symbols,gradient)
-        self.new_epoch = True
-        self.method = self._parameter_updaters[0].method
-
 
     @staticmethod
     def _compile_update_function(input_symbols,
@@ -263,40 +324,6 @@ class SemiSgd(object):
                                updates=updates,
                                mode=theano_function_mode)
 
-
-    def get_gradient(self, cost_arguments):
-
-        return self.gradient_function(*cost_arguments)
-        # Function that returns gradient of the loss function w.r.t the parameters W and b,
-        # at point of current parameters, given the input batch of images.
-
-
-    def semi_sgd_step(self, epoch_counter):
-
-        # If new epoch is started:
-        if self.new_epoch == True and self.method is not 'SGD':
-
-            # Set the old parameters (x_j) equal to the current parameters (y_(j,t)):
-            for i in range(len(self._old_parameters)):
-                self._old_parameters[i].set_value(self._parameters[i].get_value())
-
-            if self.method == 'S2GD' or (self.method == 'S2GD_plus' and epoch_counter > 1) or (self.method == 'S2GD_rolling' and epoch_counter == 1): # and epoch_counter == 1):
-                # Calculate the new full gradient:
-                cost_arguments = self._training_full_gradient_iterator.next()
-                new_full_gradient = self.get_gradient(cost_arguments)
-                for i in range(len(self._parameter_updaters)):
-                    self._parameter_updaters[i].full_gradient.set_value(new_full_gradient[i])
-
-            self.new_epoch = False
-
-        # Take a step of the inner loop:
-        # gets batch of data
-        cost_arguments = self._input_iterator.next()
-
-        # Take the step here:
-        outputs = self._update_function(*cost_arguments)
-
-        return outputs, cost_arguments
 
     def train(self):
         '''
@@ -335,78 +362,36 @@ class SemiSgd(object):
             all_callbacks = self._monitors + tuple(self.epoch_callbacks)
             for callback in all_callbacks:
                 callback.on_start_training()
-                #if classification_error is not None:
-                    #self.classification_errors = numpy.append(self.classification_errors,classification_error[0])
-
-            # Set initial parameters for SemiSGD:
-            # max_stochastic_steps_per_epoch = max # of stochastic steps per epoch
-            # v = lower bound on the constant of the strongly convex loss function
-            # stochastic_steps = # of stochastic steps taken in an epoch, calculated geometrically.
-
-            total_size_dataset = self._input_iterator.dataset.tensors[0].shape[0]
-            batch_size = self._input_iterator.batch_size
-            stochastic_steps = total_size_dataset/batch_size
-            epoch_counter = 1
-
-            if self.method == 'S2GD':
-                max_stochastic_steps_per_epoch = total_size_dataset/batch_size
-                v = 0.05
-                learning_rate = self._parameter_updaters[0].learning_rate.get_value()
-                # Calculate the sum of the probabilities for geometric distribution:
-                sum = 0
-                for t in range(1,max_stochastic_steps_per_epoch+1):
-                    add = pow((1-v*learning_rate),(max_stochastic_steps_per_epoch - t))
-                    sum = sum + add
 
             while True:
 
-                if self.method == 'S2GD':
-                    # Determine # of stochastic steps taken in the epoch:
+                # gets batch of data
+                cost_arguments = self._input_iterator.next()
 
-                    cummulative_prob = 0
-                    rand = numpy.random.uniform(0,1)
-                    for t in range(1,max_stochastic_steps_per_epoch+1):
-                        prob = pow((1-v*learning_rate),(max_stochastic_steps_per_epoch - t)) / sum
-                        cummulative_prob = cummulative_prob + prob
-                        if  rand < cummulative_prob:
-                            stochastic_steps = t
-                            break
+                # fprop-bprop, updates parameters
+                # pylint: disable=star-args
+                outputs = self._update_function(*cost_arguments)
 
-                # Run the semi-stochastic gradient descent main loop
-                for t in range(stochastic_steps):
-                    # Now take a step:
-                    outputs, cost_arguments = self.semi_sgd_step(epoch_counter)
+                # updates monitors
+                output_index = 0
+                for monitor in self._monitors:
+                    new_output_index = (output_index +
+                                        len(monitor.monitored_values))
+                    assert_less_equal(new_output_index, len(outputs))
+                    monitored_values = outputs[output_index:new_output_index]
 
-                    # updates monitors
-                    output_index = 0
-                    for monitor in self._monitors:
-                        new_output_index = (output_index +
-                                            len(monitor.monitored_values))
-                        assert_less_equal(new_output_index, len(outputs))
-                        monitored_values = outputs[output_index:new_output_index]
+                    monitor.on_batch(cost_arguments, monitored_values)
 
-                        monitor.on_batch(cost_arguments, monitored_values)
-
-                        output_index = new_output_index
-
-                    self._input_iterator.next_is_new_epoch()
-
-                self.new_epoch = True
-                epoch_counter = epoch_counter + 1
-                if epoch_counter == 2 and self.method == 'S2GD_plus':
-                    for updater in self._parameter_updaters:
-                        updater.S2GD_on.set_value(1.0)
+                    output_index = new_output_index
 
                 # calls epoch callbacks, if we've iterated through an epoch
-                # if self._input_iterator.next_is_new_epoch():
-                for callback in all_callbacks:
-                    callback.on_epoch()
-                    #if classification_error is not None:
-                        #self.classification_errors = numpy.append(self.classification_errors,classification_error[0])
+                if self._input_iterator.next_is_new_epoch():
+                    for callback in all_callbacks:
+                        callback.on_epoch()
 
         except StopTraining, exception:
             if exception.status == 'ok':
                 print("Stopped training with message: %s" % exception.message)
-                return self.classification_errors
+                return
             else:
                 raise

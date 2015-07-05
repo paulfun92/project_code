@@ -377,6 +377,17 @@ def main():
         size_training = size_tensors - args.validation_size
         training_tensors = [t[:-args.validation_size, ...] for t in tensors]
         validation_tensors = [t[-args.validation_size:, ...] for t in tensors]
+
+        shuffle_dataset = True
+        if shuffle_dataset == True:
+            def shuffle_in_unison_inplace(a, b):
+                assert len(a) == len(b)
+                p = numpy.random.permutation(len(a))
+                return a[p], b[p]
+
+            [training_tensors[0],training_tensors[1]] = shuffle_in_unison_inplace(training_tensors[0],training_tensors[1])
+            [validation_tensors[0], validation_tensors[1]] = shuffle_in_unison_inplace(validation_tensors[0], validation_tensors[1])
+
         mnist_training = Dataset(tensors=training_tensors,
                                  names=mnist_training.names,
                                  formats=mnist_training.formats)

@@ -378,16 +378,15 @@ def main():
         training_tensors = [t[:-args.validation_size, ...] for t in tensors]
         validation_tensors = [t[size_tensors - args.validation_size:, ...] for t in tensors]
 
-	shuffle_dataset = True
-	if shuffle_dataset == True:
+        shuffle_dataset = True
+        if shuffle_dataset == True:
+            def shuffle_in_unison_inplace(a, b):
+                assert len(a) == len(b)
+                p = numpy.random.permutation(len(a))
+                return a[p], b[p]
 
-	    def shuffle_in_unison_inplace(a, b):
-		assert len(a) == len(b)
-		p = numpy.random.permutation(len(a))
-		return a[p], b[p]
-
-	    [training_tensors[0],training_tensors[1]] = shuffle_in_unison_inplace(training_tensors[0],training_tensors[1])
-	    [validation_tensors[0], validation_tensors[1]] = shuffle_in_unison_inplace(validation_tensors[0], validation_tensors[1])
+            [training_tensors[0],training_tensors[1]] = shuffle_in_unison_inplace(training_tensors[0],training_tensors[1])
+            [validation_tensors[0], validation_tensors[1]] = shuffle_in_unison_inplace(validation_tensors[0], validation_tensors[1])
 
         mnist_training = Dataset(tensors=training_tensors,
                                  names=mnist_training.names,
@@ -446,7 +445,7 @@ def main():
                                                     gradient_symbol_old_param,
                                                     args.learning_rate,
                                                     args.initial_momentum,
-                                                    'S2GD_rolling',
+                                                    'SGD',
                                                     training_iterator,
                                                     args.nesterov)
             parameter_updaters.append(parameter_updater)
