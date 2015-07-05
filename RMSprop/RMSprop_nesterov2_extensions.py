@@ -55,7 +55,8 @@ class RMSpropSgdParameterUpdater(object):
 
     def __init__(self,
                  parameter,
-                 gradient,  # see (*) below
+                 parameters_peek_ahead,
+                 gradient_peek_ahead,
                  learning_rate,
                  momentum,
                  use_nesterov):
@@ -93,19 +94,11 @@ class RMSpropSgdParameterUpdater(object):
         #
 
         assert_is_instance(parameter, theano.tensor.sharedvar.SharedVariable)
-        assert_is_instance(gradient, theano.gof.Variable)
-        assert_equal(parameter.broadcastable, gradient.broadcastable,
-                     "If an Op's .grad() method is buggy, it can return "
-                     "broadcast masks.")
-        assert_is_subdtype(gradient.dtype, numpy.floating)
         assert_greater_equal(learning_rate, 0)
         assert_greater_equal(momentum, 0)
         assert_is_instance(use_nesterov, bool)
 
         floatX = theano.config.floatX
-
-        if str(gradient.dtype) != str(floatX):
-            gradient = theano.tensor.cast(gradient, floatX)
 
         #
         # define updates, set members
@@ -147,31 +140,25 @@ class RMSpropSgdParameterUpdater(object):
             broadcastable=parameter.broadcastable)
 
 
-        new_mean_square = self.decay_rate * self.mean_square + (1-self.decay_rate) * pow(gradient,2)
+        new_mean_square = self.decay_rate * self.mean_square + (1-self.decay_rate) * pow(gradient_peek_ahead,2)
         new_mean_square.name = concat('new ', self.mean_square.name)
 
         new_velocity = (self.momentum * self._velocity -
-                        self.learning_rate * (gradient / pow(new_mean_square, 0.5) + 0.6) )
+                        self.learning_rate * (gradient_peek_ahead / (pow(new_mean_square, 0.5) + 0.6)) )
         new_velocity.name = concat('new ', self._velocity.name)
 
         assert_equal(str(new_velocity.dtype), str(floatX))
         assert_equal(self._velocity.broadcastable, new_velocity.broadcastable)
 
-        step = (self.momentum * new_velocity - self.learning_rate * gradient
-                if use_nesterov
-                else new_velocity)
-
-        step2 = self.learning_rate * (gradient / ( pow(new_mean_square, 0.5) + 0.6) )
-
-        assert_equal(parameter.broadcastable,
-                     step.broadcastable)
-
-        new_parameter = parameter + step
+        new_parameter = parameter + new_velocity
         new_parameter.name = concat('new ', parameter.name)
+
+        new_parameters_peek_ahead = new_parameter - self.momentum * new_velocity
 
         self.updates = OrderedDict([(parameter, new_parameter),
                                     (self._velocity, new_velocity),
-                                    (self.mean_square, new_mean_square)])
+                                    (self.mean_square, new_mean_square),
+                                    (parameters_peek_ahead, new_parameters_peek_ahead)])
 
 
 class RMSpropSgd(object):

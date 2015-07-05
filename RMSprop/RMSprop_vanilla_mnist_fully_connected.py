@@ -39,7 +39,7 @@ from simplelearn.training import (LogsToLists,
                                   ValidationCallback,
                                   StopsOnStagnation)
 import pdb
-from RMSprop_extensions import RMSpropSgd, RMSpropSgdParameterUpdater
+from RMSprop_extensions_vanilla import RMSpropSgd, RMSpropSgdParameterUpdater
 
 
 def parse_args():
@@ -109,7 +109,7 @@ def parse_args():
                         help=("Initial momentum."))
 
     parser.add_argument("--nesterov",
-                        default=False,
+                        default=True,
                         action="store_true",
                         help=("Use Nesterov accelerated gradients (default: "
                               "False)."))
@@ -418,6 +418,7 @@ def main():
     #
     # Makes parameter updaters
     #
+    training_iterator = mnist_training.iterator(iterator_type='sequential',batch_size=args.batch_size)
 
     parameters = []
     parameter_updaters = []
@@ -434,10 +435,6 @@ def main():
                                                     args.nesterov)
             parameter_updaters.append(parameter_updater)
 
-            momentum_updaters.append(LinearlyInterpolatesOverEpochs(
-                parameter_updater.momentum,
-                args.final_momentum,
-                args.epochs_to_momentum_saturation))
 
     updates = [updater.updates.values()[0] - updater.updates.keys()[0]
                for updater in parameter_updaters]
@@ -511,8 +508,7 @@ def main():
         monitors=[validation_loss_monitor, mcr_monitor])
 
     trainer = RMSpropSgd([image_uint8_node, label_node],
-                  mnist_training.iterator(iterator_type='sequential',
-                                          batch_size=args.batch_size),
+                  training_iterator,
                   parameters,
                   parameter_updaters,
                   monitors=[training_loss_monitor],
