@@ -41,7 +41,7 @@ from simplelearn.training import (SgdParameterUpdater,
                                   ValidationCallback,
                                   StopsOnStagnation)
 import pdb
-from extension_BGFS import BgfsSgd, BgfsSgdParameterUpdater
+from extension_BGFS import BgfsSgd, BgfsSgdParameterUpdater, BgfsSgd2
 
 
 def parse_args():
@@ -158,6 +158,7 @@ def parse_args():
 
 def build_fc_classifier(input_node,
                         sizes,
+                        input_size,
                         sparse_init_counts,
                         dropout_include_probabilities,
                         rng,
@@ -233,6 +234,38 @@ def build_fc_classifier(input_node,
 
     last_node = input_node
 
+    rng = numpy.random.RandomState(281934)
+    std_deviation = .05
+
+    params_temp1 = [rng.standard_normal( (input_size * sizes[0]) ).astype(theano.config.floatX)*std_deviation,
+                    numpy.zeros(sizes[0], dtype=theano.config.floatX) ]
+
+    params_temp2 = sum([ [rng.standard_normal( sizes[i] * sizes[i+1] ).astype(theano.config.floatX)*std_deviation,
+                          numpy.zeros(sizes[i+1], dtype=theano.config.floatX)] for i in range(len(sizes)-1) ],[] )
+
+    params_flat_values = numpy.concatenate( params_temp1 + params_temp2 )
+
+    params_flat = theano.shared(params_flat_values)
+
+    param_arrays = []
+    index_to = input_size * sizes[0]
+    param_arrays.append(params_flat[:index_to].reshape((input_size, sizes[0]))) # Add weights
+    index_from = index_to
+    index_to += sizes[0]
+    param_arrays.append(params_flat[index_from:index_to]) # Add bias
+
+    for i in range(len(sizes)-1):
+
+        index_from = index_to
+        index_to += sizes[i]*sizes[i+1]
+        param_arrays.append(params_flat[index_from:index_to].reshape((sizes[i], sizes[i+1]))) # Add weight
+        #print(index_from, index_to)
+        #print 'reshaped to'
+        #print(sizes[i], sizes[i+1])
+        index_from = index_to
+        index_to += sizes[i+1]
+        param_arrays.append(params_flat[index_from:index_to]) # Add bias
+
     for layer_index, layer_output_size in enumerate(sizes):
         # Add dropout, if asked for
         include_probability = dropout_include_probabilities[layer_index]
@@ -244,9 +277,9 @@ def build_fc_classifier(input_node,
                                     dtype=None)
 
         if layer_index < (len(sizes) - 1):
-            last_node = AffineLayer(last_node, output_format)
+            last_node = AffineLayer(last_node, output_format, param_arrays[layer_index*2], param_arrays[layer_index*2+1])
         else:
-            last_node = SoftmaxLayer(last_node, output_format)
+            last_node = SoftmaxLayer(last_node, output_format, param_arrays[layer_index*2], param_arrays[layer_index*2+1])
 
         affine_nodes.append(last_node.affine_node)
 
@@ -307,6 +340,7 @@ def build_fc_classifier(input_node,
 
     # Initialize the affine layer weights (not the biases, and not the softmax
     # weights)
+    '''
     for sparse_init_count, affine_node in safe_izip(sparse_init_counts,
                                                     affine_nodes[:-1]):
         # pylearn2 doesn't sparse_init the biases. I also found that
@@ -314,8 +348,9 @@ def build_fc_classifier(input_node,
         init_sparse_linear(affine_node.linear_node.params,
                            sparse_init_count,
                            rng)
+    '''
 
-    return affine_nodes, last_node
+    return affine_nodes, last_node, params_flat
 
 
 def print_loss(values, _):  # 2nd argument: formats
@@ -377,6 +412,7 @@ def main():
         size_tensors = tensors[0].shape[0]
         training_tensors = [t[:-args.validation_size, ...] for t in tensors]
         validation_tensors = [t[size_tensors - args.validation_size:, ...] for t in tensors]
+        input_size = tensors[0].shape[1]*tensors[0].shape[1]
 
         shuffle_dataset = True
         if shuffle_dataset == True:
@@ -406,8 +442,10 @@ def main():
     theano_rng = RandomStreams(23845)
 
     (affine_nodes,
-     output_node) = build_fc_classifier(image_node,
+     output_node,
+     params_flat) = build_fc_classifier(image_node,
                                         sizes,
+                                        input_size,
                                         sparse_init_counts,
                                         args.dropout_include_rates,
                                         rng,
@@ -417,38 +455,18 @@ def main():
     loss_sum = loss_node.output_symbol.mean()
     max_epochs = 10000
 
-    parameters = []
-    old_param_symbols = []
-
-    for affine_node in affine_nodes:
-        for params in (affine_node.linear_node.params,
-                       affine_node.bias_node.params):
-            parameters.append(params)
-            old_param_symbol = theano.shared(numpy.zeros(params.get_value().shape, dtype=params.dtype))
-            old_param_symbols.append(old_param_symbol)
-
-    loss_sum2 = theano.clone(loss_sum, replace = {parameter: old_parameter for parameter,old_parameter in safe_izip(parameters, old_param_symbols)} )
     #
     # Makes parameter updaters
     #
     training_iterator = mnist_training.iterator(iterator_type='sequential',batch_size=args.batch_size)
 
-    parameter_updaters = []
-    all_gradients = []
-    momentum_updaters = []
-    for params, old_params in safe_izip(parameters, old_param_symbols):
-            gradients = theano.gradient.grad(loss_sum, params)
-            all_gradients.append(gradients)
-            gradient_symbol_old_param = theano.gradient.grad(loss_sum2, old_params)
-            parameter_updater = BgfsSgdParameterUpdater(params,
-                                                        old_params,
-                                                    gradients,
-                                                    gradient_symbol_old_param,
-                                                    args.learning_rate)
-            parameter_updaters.append(parameter_updater)
+    gradients = theano.gradient.grad(loss_sum, params_flat)
+    parameter_updater = BgfsSgdParameterUpdater(params_flat,
+                                                gradients,
+                                                args.learning_rate,
+                                                0.5)
 
-    updates = [updater.updates.values()[0] - updater.updates.keys()[0]
-               for updater in parameter_updaters]
+    updates = [parameter_updater.updates.values()[0] - parameter_updater.updates.keys()[0]]
     update_norm_monitors = [UpdateNormMonitor("layer %d %s" %
                                               (i // 2,
                                                "weights" if i % 2 == 0 else
@@ -518,12 +536,21 @@ def main():
         input_iterator=mnist_validation_iterator,
         monitors=[validation_loss_monitor, mcr_monitor])
 
+    '''
     trainer = BgfsSgd([image_uint8_node, label_node],
                   training_iterator,
                   parameters,
                   old_param_symbols,
                   parameter_updaters,
                   all_gradients,
+                  monitors=[training_loss_monitor],
+                  training_set = mnist_training,
+                  epoch_callbacks=[])
+    '''
+    trainer = BgfsSgd2([image_uint8_node, label_node],
+                  training_iterator,
+                  params_flat,
+                  parameter_updater,
                   monitors=[training_loss_monitor],
                   training_set = mnist_training,
                   epoch_callbacks=[])
@@ -538,8 +565,7 @@ def main():
     #      ('validation_loss_logger', validation_loss_logger),
     #      ('model', model)))
 
-    trainer.epoch_callbacks = (momentum_updaters +
-                               [PicklesOnEpoch(stuff_to_pickle,
+    trainer.epoch_callbacks = ([PicklesOnEpoch(stuff_to_pickle,
                                                make_output_filename(args),
                                                overwrite=False),
                                 validation_callback,

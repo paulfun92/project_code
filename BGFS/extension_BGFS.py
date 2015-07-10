@@ -34,14 +34,15 @@ import pdb
 
 
 
-class BgfsSgdParameterUpdater(object):
+class BgfsParameterUpdater(object):
 
     def __init__(self,
-                 parameter,
-                 old_parameter,
+                 parameters,
+                 old_parameters,
                  gradient,
                  gradient_at_old_params,
-                 learning_rate):
+                 learning_rate,
+                 momentum):
 
 
         floatX = theano.config.floatX
@@ -68,32 +69,197 @@ class BgfsSgdParameterUpdater(object):
                                  **kwargs)
 
         self.learning_rate = make_shared_floatX(learning_rate,
-                                                concat(parameter.name,
+                                                concat(parameters.name,
                                                        ' learning rate'))
 
-        self.inverse_hessian_estimate = make_shared_floatX(
-            numpy.identity(parameter.get_value().shape[0]),
-            concat(parameter.name, ' inverse hessian estimate'))
+        self.momentum = make_shared_floatX(momentum,
+                                           concat(parameters.name, ' momentum'))
 
-        change_parameter = old_parameter - parameter #d_k
+        self._velocity = make_shared_floatX(
+            0.0 * parameters.get_value(),
+            concat(parameters.name, ' velocity'),
+            broadcastable=parameters.broadcastable)
+
+        '''
+        # Try normal SGD first:
+        new_velocity = (self.momentum * self._velocity -
+                        self.learning_rate * gradient)
+
+        new_parameters = parameters + new_velocity
+
+        self.updates = OrderedDict([(parameters, new_parameters),
+                                    (self._velocity, new_velocity)])
+
+        '''
+        self.inverse_hessian_estimate = make_shared_floatX(
+            numpy.identity(parameters.get_value().shape[0]),
+            concat(parameters.name, ' inverse hessian estimate'))
+
+        change_parameter = old_parameters - parameters #d_k
         change_gradient = gradient - gradient_at_old_params
-        n = parameter.get_value().shape[0]
+        n = parameters.get_value().shape[0]
         rho = 1.0/(theano.dot(change_gradient.T,change_parameter))
 
         new_inverse_hessian_estimate = ( theano.dot( theano.dot( (numpy.identity(n, dtype=floatX) - rho*theano.dot(change_parameter,change_gradient.T)),
                                                     self.inverse_hessian_estimate),(numpy.identity(n, dtype=floatX) - rho*theano.dot(change_gradient,change_parameter.T)) )
                                                     + rho*theano.dot(change_parameter,change_parameter.T) )
 
-        step_direction = -1.0 * new_inverse_hessian_estimate * gradient
-        new_parameter = parameter + self.learning_rate * step_direction
-        new_parameter.name = concat('new ', parameter.name)
-        parameter_ = parameter
+        step_direction = -1.0 * theano.dot(new_inverse_hessian_estimate, gradient)
+        new_parameters = parameters + self.learning_rate * step_direction
+        new_parameters.name = concat('new ', parameters.name)
+        parameters_ = parameters
 
-        self.updates = OrderedDict([(parameter, new_parameter),
-                                    (old_parameter, parameter_),
+        self.updates = OrderedDict([(parameters, new_parameters),
+                                    (old_parameters, parameters_),
                                     (self.inverse_hessian_estimate, new_inverse_hessian_estimate)])
 
-class BgfsSgd(object):
+class Bgfs2(object):
+
+
+    def __init__(self,
+                inputs,
+                input_iterator,
+                parameters,
+                parameter_updater,
+                monitors,
+                training_set,
+                epoch_callbacks,
+                theano_function_mode=None):
+
+
+        #
+        # Sets members
+        #
+
+        self._input_iterator = input_iterator
+        self._parameters = parameters
+        self._parameter_updater = parameter_updater
+        self._monitors = tuple(monitors)
+
+        input_symbols = [i.output_symbol for i in inputs]
+
+        self._compile_update_function_args = \
+            {'input_symbols': input_symbols,
+             'monitors': self._monitors,
+             'parameter_updater': self._parameter_updater,
+             'theano_function_mode': theano_function_mode}
+
+        self._update_function = self._compile_update_function(
+            **self._compile_update_function_args)
+
+        repeated_callbacks = frozenset(monitors).intersection(epoch_callbacks)
+        assert_equal(len(repeated_callbacks),
+                     0,
+                     "There were duplicate entries between monitors and "
+                     "epoch_callbacks: %s" % str(repeated_callbacks))
+
+        # These get called once before any training, and after each epoch
+        # thereafter. One of them must halt the training at some point by
+        # throwing a StopTraining exception.
+        self.epoch_callbacks = tuple(epoch_callbacks)
+
+        self._train_called = False
+
+        self._training_full_gradient_iterator = training_set.iterator(iterator_type='sequential', batch_size=50000) #training_set.size
+        self.classification_errors = numpy.asarray([])
+
+        self.new_epoch = True
+
+
+    @staticmethod
+    def _compile_update_function(input_symbols,
+                                 monitors,
+                                 parameter_updater,
+                                 theano_function_mode):
+        '''
+        Compiles the function that computes the monitored values.
+        '''
+
+        output_symbols = []
+        for monitor in monitors:
+            output_symbols.extend(monitor.monitored_values)
+
+        updates = OrderedDict()
+        updates.update(parameter_updater.updates)
+
+        return theano.function(input_symbols,
+                               output_symbols,
+                               updates=updates,
+                               mode=theano_function_mode)
+
+
+    def train(self):
+        '''
+        Runs training until a StopTraining exception is raised.
+
+        Training runs indefinitely until one of self.epoch_callbacks raises
+        a StopTraining exception.
+        '''
+
+        if self._train_called:
+            raise RuntimeError("train() has already been called on this %s. "
+                               "Re-running train() risks inadvertently "
+                               "carrying over implicit state from the "
+                               "previous training run, such as the direction "
+                               "of parameter updates (via the momentum "
+                               "term), or the internal state of the Monitors "
+                               "or EpochCallbacks. Instead, instantiate a new "
+                               "copy of this %s and run train() on that." %
+                               (type(self), type(self)))
+
+        self._train_called = True
+
+        if len(self.epoch_callbacks) + len(self._monitors) == 0:
+            raise RuntimeError("self._monitors and self.epoch_callbacks are "
+                               "both empty, so this will "
+                               "iterate through the training data forever. "
+                               "Please add an EpochCallback or "
+                               "Monitor that will throw a "
+                               "StopTraining exception at some point.")
+
+        #
+        # End sanity checks
+        #
+
+        try:
+            all_callbacks = self._monitors + tuple(self.epoch_callbacks)
+            for callback in all_callbacks:
+                callback.on_start_training()
+
+            while True:
+
+                # gets batch of data
+                cost_arguments = self._input_iterator.next()
+
+                # fprop-bprop, updates parameters
+                # pylint: disable=star-args
+                outputs = self._update_function(*cost_arguments)
+
+                # updates monitors
+                output_index = 0
+                for monitor in self._monitors:
+                    new_output_index = (output_index +
+                                        len(monitor.monitored_values))
+                    assert_less_equal(new_output_index, len(outputs))
+                    monitored_values = outputs[output_index:new_output_index]
+
+                    monitor.on_batch(cost_arguments, monitored_values)
+
+                    output_index = new_output_index
+
+                # calls epoch callbacks, if we've iterated through an epoch
+                if self._input_iterator.next_is_new_epoch():
+                    for callback in all_callbacks:
+                        callback.on_epoch()
+
+        except StopTraining, exception:
+            if exception.status == 'ok':
+                print("Stopped training with message: %s" % exception.message)
+                return self.classification_errors
+            else:
+                raise
+
+class Bgfs(object):
 
 
     def __init__(self,
