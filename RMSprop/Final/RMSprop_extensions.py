@@ -154,7 +154,8 @@ class RMSpropSgdParameterUpdater(ParameterUpdater):
 
         super(RMSpropSgdParameterUpdater, self).__init__(updates)
 
-class RMSpropSgdParameterUpdater(object):
+
+class RMSpropNesterovSgdParameterUpdater(ParameterUpdater):
     '''
     Defines how to update parameters using SGD with momentum.
 
@@ -224,8 +225,6 @@ class RMSpropSgdParameterUpdater(object):
                      "broadcast masks.")
         assert_is_subdtype(gradient.dtype, numpy.floating)
         assert_greater_equal(learning_rate, 0)
-        assert_greater_equal(momentum, 0)
-        assert_is_instance(use_nesterov, bool)
 
         floatX = theano.config.floatX
 
@@ -294,191 +293,8 @@ class RMSpropSgdParameterUpdater(object):
         new_parameter = parameter + step
         new_parameter.name = concat('new ', parameter.name)
 
-        self.updates = OrderedDict([(parameter, new_parameter),
+        updates = OrderedDict([(parameter, new_parameter),
                                     (self._velocity, new_velocity),
                                     (self.mean_square, new_mean_square)])
 
-
-class RMSpropSgd(object):
-
-    '''
-    Uses stochastic gradient descent to optimize a cost w.r.t. parameters.
-
-    The parameters and the inputs may be the same.
-
-    At each iteration this computes the gradients of each parameter with
-    respect to the cost function, then updates the parameter value using
-    the gradients. How this update is performed (e.g. learning rate,
-    momentum value & type, etc) is up to the SgdParameterUpdater
-    objects passed into the constructor.
-    '''
-
-    def __init__(self,
-                 inputs,
-                 input_iterator,
-                 parameters,
-                 parameter_updaters,
-                 epoch_callbacks,
-                 theano_function_mode=None):
-
-        '''
-        Parameters
-        ----------
-
-        inputs: sequence of Nodes.
-          Symbols for the outputs of the input_iterator.
-          These should come from input_iterator.make_input_nodes()
-
-        input_iterator: simplelearn.data.DataIterator
-          Yields tuples of training set batches, such as (values, labels).
-
-        parameters: sequence of theano.tensor.sharedvar.SharedVariables
-          What this trainer modifies to lower the cost. These are typically
-          model weights, though they could also be inputs (e.g. for optimizing
-          input images).
-
-        parameter_updaters: sequence of SgdParameterUpdaters
-          updaters for the corresponding elements in <parameters>.
-          These are defined using the loss function to be minimized.
-
-        monitors: (optional) sequence of Monitors.
-          These are also used as epoch callbacks.
-
-        epoch_callbacks: sequence of EpochCallbacks
-          One of these must throw a StopTraining exception for the training to
-          halt.
-
-        theano_function_mode: theano.compile.Mode
-          Optional. The 'mode' argument to pass to theano.function().
-          An example: pylearn2.devtools.nan_guard.NanGuard()
-        '''
-
-        #
-        # sanity-checks the arguments.
-        #
-
-        assert_all_is_instance(inputs, Node)
-        assert_is_instance(input_iterator, DataIterator)
-        assert_true(input_iterator.next_is_new_epoch())
-
-        for (input,
-             iterator_input) in safe_izip(inputs,
-                                          input_iterator.make_input_nodes()):
-            assert_equal(input.output_format, iterator_input.output_format)
-
-        assert_equal(len(callbacks),
-                     len(frozenset(callbacks)),
-                     "There were duplicate callbacks.")
-
-        assert_all_is_instance(callbacks, EpochCallback)
-
-        #
-        # Sets members
-        #
-
-        self._inputs = inputs
-        self._input_iterator = input_iterator
-        self._theano_function_mode = theano_function_mode
-        self.epoch_callbacks = list(callbacks)
-        self._train_called = False
-
-
-    def _compile_update_function(self):
-        input_symbols = [i.output_symbol for i in self._inputs]
-
-        iteration_callbacks = [e for e in self.epoch_callbacks
-                               if isinstance(e, IterationCallback)]
-
-        output_symbols = []
-        for iteration_callback in iteration_callbacks:
-            for node_to_compute in iteration_callback.nodes_to_compute:
-                output_symbols.append(node_to_compute.output_symbol)
-
-        update_pairs = OrderedDict()
-
-        for iteration_callback in iteration_callbacks:
-            update_pairs.update(iteration_callback.update_pairs)
-
-        return theano.function(input_symbols,
-                               output_symbols,
-                               updates=update_pairs,
-                               mode=self._theano_function_mode)
-
-
-    def train(self):
-        '''
-        Runs training until a StopTraining exception is raised.
-
-        Training runs indefinitely until one of self.epoch_callbacks raises
-        a StopTraining exception.
-        '''
-
-        if self._train_called:
-            raise RuntimeError("train() has already been called on this %s. "
-                               "Re-running train() risks inadvertently "
-                               "carrying over implicit state from the "
-                               "previous training run, such as the direction "
-                               "of parameter updates (via the momentum "
-                               "term), or the internal state of the Monitors "
-                               "or EpochCallbacks. Instead, instantiate a new "
-                               "copy of this %s and run train() on that." %
-                               (type(self), type(self)))
-
-        self._train_called = True
-
-        if len(self.epoch_callbacks) + len(self._monitors) == 0:
-            raise RuntimeError("self._monitors and self.epoch_callbacks are "
-                               "both empty, so this will "
-                               "iterate through the training data forever. "
-                               "Please add an EpochCallback or "
-                               "Monitor that will throw a "
-                               "StopTraining exception at some point.")
-
-        assert_all_is_instance(self.epoch_callbacks, EpochCallback)
-
-        #
-        # End sanity checks
-        #
-
-        update_function = self._compile_update_function()
-
-
-        iteration_callbacks = [c for c in self.epoch_callbacks
-                               if isinstance(c, IterationCallback)]
-
-        try:
-            for epoch_callback in self.epoch_callbacks:
-                epoch_callback.on_start_training()
-
-            while True:
-
-                # gets batch of data
-                cost_arguments = self._input_iterator.next()
-
-                # fprop-bprop, updates parameters
-                # pylint: disable=star-args
-                outputs = self._update_function(*cost_arguments)
-
-                # updates monitors
-                output_index = 0
-                for monitor in self._monitors:
-                    new_output_index = (output_index +
-                                        len(monitor.monitored_values))
-                    assert_less_equal(new_output_index, len(outputs))
-                    monitored_values = outputs[output_index:new_output_index]
-
-                    monitor.on_batch(cost_arguments, monitored_values)
-
-                    output_index = new_output_index
-
-                # calls epoch callbacks, if we've iterated through an epoch
-                if self._input_iterator.next_is_new_epoch():
-                    for callback in all_callbacks:
-                        callback.on_epoch()
-
-        except StopTraining, exception:
-            if exception.status == 'ok':
-                print("Stopped training with message: %s" % exception.message)
-                return
-            else:
-                raise
+        super(RMSpropNesterovSgdParameterUpdater, self).__init__(updates)

@@ -67,9 +67,9 @@ training_set, validation_set = [Dataset(tensors=t,
                                 for t in (training_tensors, validation_tensors)]
 
 input_size = training_tensors[0].shape[1]*training_tensors[0].shape[2]
-sizes = [2,2,10]
+sizes = [10,10,10]
 
-training_iter = training_set.iterator(iterator_type='sequential', batch_size=100)
+training_iter = training_set.iterator(iterator_type='sequential', batch_size=50000)
 
 image_node, label_node = training_iter.make_input_nodes()
 
@@ -153,8 +153,7 @@ param_updater = BgfsParameterUpdater(parameters=params_flat,
                                      old_parameters=params_old_flat,
                                      gradient=gradient_symbol,
                                      gradient_at_old_params=gradient_symbol_old_params,
-                                     learning_rate=.1,
-                                     momentum=0.5)
+                                     learning_rate=.3)
 
 # packages chain of nodes from the uint8 image_node up to the softmax_layer, to be saved to a file.
 model = SerializableModel([image_node], [softmax_layer])

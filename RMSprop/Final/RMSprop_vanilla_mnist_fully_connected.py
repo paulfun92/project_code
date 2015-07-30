@@ -26,8 +26,7 @@ from simplelearn.io import SerializableModel
 from simplelearn.data.dataset import Dataset
 from simplelearn.data.mnist import load_mnist
 from simplelearn.formats import DenseFormat
-from simplelearn.training import (SgdParameterUpdater,
-                                  Sgd,
+from simplelearn.training import (Sgd,
                                   # LogsToLists,
                                   SavesAtMinimum,
                                   MeanOverEpoch,
@@ -38,34 +37,8 @@ from simplelearn.training import (SgdParameterUpdater,
                                   StopsOnStagnation,
                                   EpochLogger)
 import pdb
+from RMSprop_extensions import RMSpropSgdParameterUpdater
 
-class ImageLookeupNode(Node):
-
-    def __init__(self,input_node, images_array):
-
-        self.images = images_array
-        output_symbol = self.images[input_node.output_symbol]
-        output_format = DenseFormat(axes=('b', '0', '1'),
-                                    shape=(-1, 28, 28),
-                                    dtype='uint8')
-
-        super(ImageLookeupNode, self).__init__(input_nodes=input_node,
-                                        output_symbol=output_symbol,
-                                        output_format=output_format)
-
-class LabelLookeupNode(Node):
-
-    def __init__(self,input_node, labels_array):
-
-        self.labels = labels_array
-        output_symbol = self.labels[input_node.output_symbol]
-        output_format = DenseFormat(axes=('b', ),
-                                    shape=(-1, ),
-                                    dtype='uint8')
-
-        super(LabelLookeupNode, self).__init__(input_nodes=input_node,
-                                        output_symbol=output_symbol,
-                                        output_format=output_format)
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -396,15 +369,12 @@ def main():
             [training_tensors[0],training_tensors[1]] = shuffle_in_unison_inplace(training_tensors[0],training_tensors[1])
             [validation_tensors[0], validation_tensors[1]] = shuffle_in_unison_inplace(validation_tensors[0], validation_tensors[1])
 
-
         mnist_training = Dataset(tensors=training_tensors,
                                  names=mnist_training.names,
                                  formats=mnist_training.formats)
         mnist_validation = Dataset(tensors=validation_tensors,
                                    names=mnist_training.names,
                                    formats=mnist_training.formats)
-
-
 
     mnist_validation_iterator = mnist_validation.iterator(
         iterator_type='sequential',
@@ -434,23 +404,15 @@ def main():
 
     parameters = []
     parameter_updaters = []
-    momentum_updaters = []
     for affine_node in affine_nodes:
         for params in (affine_node.linear_node.params,
                        affine_node.bias_node.params):
             parameters.append(params)
             gradients = theano.gradient.grad(loss_sum, params)
-            parameter_updater = SgdParameterUpdater(params,
+            parameter_updater = RMSpropSgdParameterUpdater(params,
                                                     gradients,
-                                                    args.learning_rate,
-                                                    args.initial_momentum,
-                                                    args.nesterov)
+                                                    args.learning_rate)
             parameter_updaters.append(parameter_updater)
-
-            momentum_updaters.append(LinearlyInterpolatesOverEpochs(
-                parameter_updater.momentum,
-                args.final_momentum,
-                args.epochs_to_momentum_saturation))
 
     #
     # Makes batch and epoch callbacks
@@ -532,7 +494,6 @@ def main():
                   mnist_training.iterator(iterator_type='sequential',
                                           batch_size=args.batch_size),
                   callbacks=(parameter_updaters +
-                             momentum_updaters +
                              [training_loss_monitor,
                               training_misclassification_monitor,
                               validation_callback,

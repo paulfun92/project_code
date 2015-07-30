@@ -39,16 +39,13 @@ import pdb
 
 
 
-class SemiSgdParameterUpdater(ParameterUpdater):
+class GdParameterUpdater(ParameterUpdater):
 
     def __init__(self,
                  parameter,
                  gradient,
-                 gradient_at_old_params,
                  learning_rate,
                  momentum,
-                 method,
-                 input_iterator,
                  use_nesterov):
 
         #
@@ -57,12 +54,10 @@ class SemiSgdParameterUpdater(ParameterUpdater):
 
         assert_is_instance(parameter, theano.tensor.sharedvar.SharedVariable)
         assert_is_instance(gradient, theano.gof.Variable)
-        assert_is_instance(gradient_at_old_params, theano.gof.Variable)
         assert_equal(parameter.broadcastable, gradient.broadcastable,
                      "If an Op's .grad() method is buggy, it can return "
                      "broadcast masks.")
         assert_is_subdtype(gradient.dtype, numpy.floating)
-        assert_is_subdtype(gradient_at_old_params.dtype, numpy.floating)
         assert_greater_equal(learning_rate, 0)
         assert_greater_equal(momentum, 0)
         assert_is_instance(use_nesterov, bool)
@@ -107,33 +102,15 @@ class SemiSgdParameterUpdater(ParameterUpdater):
             concat(parameter.name, ' full gradient'),
             broadcastable=parameter.broadcastable)
 
-        # This variable takes value 1 if S2GD is used and 0 otherwise.
-        self.method = method
-        if self.method == 'SGD' or self.method == 'S2GD_plus':
-            multiplier = 0.0
-        elif self.method == 'S2GD' or self.method == 'S2GD_rolling':
-            multiplier = 1.0
-        else:
-            raise Exception('Please enter a valid method: "SGD", "S2GD", "S2GD_plus", or "S2GD_rolling"')
 
-        self.S2GD_on = make_shared_floatX(numeric_var=multiplier, name='use_S2GD')
-
-        # updated_full_gradient = 0
-        if self.method == 'S2GD_rolling':
-            total_size_dataset = float(input_iterator.dataset.tensors[0].shape[0])
-            batch_size = float(input_iterator.batch_size)
-            updated_full_gradient = (gradient*batch_size + self.full_gradient*total_size_dataset - gradient_at_old_params*batch_size)/ total_size_dataset
-            new_velocity = self.momentum* self._velocity - self.learning_rate * updated_full_gradient
-            new_velocity.name = concat('new ', self._velocity.name)
-        else:
-            new_velocity = self.momentum* self._velocity - self.learning_rate * (gradient + self.S2GD_on * (self.full_gradient - gradient_at_old_params))
-            new_velocity.name = concat('new ', self._velocity.name)
+    	new_velocity = self.momentum* self._velocity - self.learning_rate * self.full_gradient 
+    	new_velocity.name = concat('new ', self._velocity.name)
 
 
         assert_equal(str(new_velocity.dtype), str(floatX))
         assert_equal(self._velocity.broadcastable, new_velocity.broadcastable)
 
-        step = (self.momentum * new_velocity - self.learning_rate * gradient
+        step = (self.momentum * new_velocity - self.learning_rate * self.full_gradient
                 if use_nesterov
                 else new_velocity)
 
@@ -143,14 +120,9 @@ class SemiSgdParameterUpdater(ParameterUpdater):
         new_parameter = parameter + step
         new_parameter.name = concat('new ', parameter.name)
 
-        # self.updates = 0
-        if self.method == 'S2GD_rolling':
-            updates = OrderedDict([(parameter, new_parameter),
-                                        (self._velocity, new_velocity),
-                                        (self.full_gradient, updated_full_gradient)])
-        else:
-            updates = OrderedDict([(parameter, new_parameter),
-                                        (self._velocity, new_velocity)])
+
+        updates = OrderedDict([(parameter, new_parameter),
+                                (self._velocity, new_velocity),
 
         total_size_dataset = input_iterator.dataset.tensors[0].shape[0]
         batch_size = input_iterator.batch_size
@@ -160,7 +132,8 @@ class SemiSgdParameterUpdater(ParameterUpdater):
 
         super(SemiSgdParameterUpdater, self).__init__(updates)
 
-class SemiSgd(object):
+
+class Gd(object):
 
 
     def __init__(self,
@@ -198,8 +171,12 @@ class SemiSgd(object):
         #
 
         self._input_iterator = input_iterator
+
+        total_size_dataset = self._input_iterator.dataset.tensors[0].shape[0]
+        batch_size = self._input_iterator.batch_size
+        self.batches_in_epoch = total_size_dataset / batch_size
+
         self._parameters = tuple(parameters)
-        self._old_parameters = tuple(old_parameters)
         self._parameter_updaters = tuple(parameter_updaters)
         self._theano_function_mode = theano_function_mode
         self._inputs = tuple(inputs)
@@ -210,8 +187,6 @@ class SemiSgd(object):
 
         self._train_called = False
 
-        self.new_epoch = True
-        self.method = self._parameter_updaters[0].method
         self.update_function = self._compile_update_function(input_symbols)
         self.full_gradient_function = self._compile_full_gradient_update_function(input_symbols)
 
@@ -258,29 +233,16 @@ class SemiSgd(object):
         for i in range(len(self._parameter_updaters)):
             self._parameter_updaters[i].full_gradient.set_value(0*self._parameter_updaters[i].full_gradient.get_value())
 
-        for _ in range(self.stochastic_steps):
+        for _ in range(self.batches_in_epoch):
 
             cost_arguments = self._input_iterator.next()
             self.full_gradient_function(*cost_arguments)
 
 
-    def semi_sgd_step(self, epoch_counter):
+    def Gd_step(self, epoch_counter):
 
-        # If new epoch is started:
-        if self.new_epoch == True and self.method is not 'SGD':
-
-            # Set the old parameters (x_j) equal to the current parameters (y_(j,t)):
-            for i in range(len(self._old_parameters)):
-                self._old_parameters[i].set_value(self._parameters[i].get_value())
-
-            if self.method == 'S2GD' or (self.method == 'S2GD_plus' and epoch_counter > 1) or (self.method == 'S2GD_rolling' and epoch_counter == 1): # and epoch_counter == 1):
-                # Update full gradient:
-                self.update_full_gradient()
-
-            self.new_epoch = False
-
-        # Take a step of the inner loop:
-        # gets batch of data
+        # Calculate new full gradient:
+        self.update_full_gradient()
         cost_arguments = self._input_iterator.next()
 
         # Take the step here:
@@ -330,69 +292,34 @@ class SemiSgd(object):
             for epoch_callback in self.epoch_callbacks:
                 epoch_callback.on_start_training()
 
-            # Set initial parameters for SemiSGD:
-            # max_stochastic_steps_per_epoch = max # of stochastic steps per epoch
-            # v = lower bound on the constant of the strongly convex loss function
-            # stochastic_steps = # of stochastic steps taken in an epoch, calculated geometrically.
-
-            total_size_dataset = self._input_iterator.dataset.tensors[0].shape[0]
-            batch_size = self._input_iterator.batch_size
-            self.stochastic_steps = total_size_dataset/batch_size
-            epoch_counter = 1
-
-            if self.method == 'S2GD':
-                max_stochastic_steps_per_epoch = total_size_dataset/batch_size
-                v = 0.05
-                learning_rate = self._parameter_updaters[0].learning_rate.get_value()
-                # Calculate the sum of the probabilities for geometric distribution:
-                sum = 0
-                for t in range(1,max_stochastic_steps_per_epoch+1):
-                    add = pow((1-v*learning_rate),(max_stochastic_steps_per_epoch - t))
-                    sum = sum + add
-
             while True:
 
-                if self.method == 'S2GD':
-                    # Determine # of stochastic steps taken in the epoch:
+                all_callback_outputs = self.semi_sgd_step(epoch_counter)
 
-                    cummulative_prob = 0
-                    rand = numpy.random.uniform(0,1)
-                    for t in range(1,max_stochastic_steps_per_epoch+1):
-                        prob = pow((1-v*learning_rate),(max_stochastic_steps_per_epoch - t)) / sum
-                        cummulative_prob = cummulative_prob + prob
-                        if  rand < cummulative_prob:
-                            self.stochastic_steps = t
-                            break
+                # calls iteration_callbacks' on_iteration() method, passing
+                # in their output values, if any.
+                output_index = 0
+                for iteration_callback in iteration_callbacks:
+                    num_outputs = len(iteration_callback.nodes_to_compute)
+                    new_output_index = output_index + num_outputs
 
-                # Run the semi-stochastic gradient descent main loop
-                for t in range(self.stochastic_steps):
-                    # Now take a step:
-                    all_callback_outputs = self.semi_sgd_step(epoch_counter)
+                    assert_less_equal(new_output_index,
+                                      len(all_callback_outputs))
 
-                    # calls iteration_callbacks' on_iteration() method, passing
-                    # in their output values, if any.
-                    output_index = 0
-                    for iteration_callback in iteration_callbacks:
-                        num_outputs = len(iteration_callback.nodes_to_compute)
-                        new_output_index = output_index + num_outputs
+                    outputs = \
+                        all_callback_outputs[output_index:new_output_index]
 
-                        assert_less_equal(new_output_index,
-                                          len(all_callback_outputs))
+                    iteration_callback.on_iteration(outputs)
 
-                        outputs = \
-                            all_callback_outputs[output_index:new_output_index]
+                    output_index = new_output_index
 
-                        iteration_callback.on_iteration(outputs)
+                assert_equal(output_index, len(all_callback_outputs))
 
-                        output_index = new_output_index
-
-                    assert_equal(output_index, len(all_callback_outputs))
-
-                    # if we've iterated through an epoch, call epoch_callbacks'
-                    # on_epoch() methods.
-                    if self._input_iterator.next_is_new_epoch():
-                        for epoch_callback in self.epoch_callbacks:
-                            epoch_callback.on_epoch()
+                # if we've iterated through an epoch, call epoch_callbacks'
+                # on_epoch() methods.
+                if self._input_iterator.next_is_new_epoch():
+                    for epoch_callback in self.epoch_callbacks:
+                        epoch_callback.on_epoch()
 
         except StopTraining, exception:
             if exception.status == 'ok':

@@ -40,7 +40,7 @@ from simplelearn.training import (SgdParameterUpdater,
                                   ValidationCallback,
                                   StopsOnStagnation)
 import pdb
-from extension_BGFS import Bgfs, BgfsParameterUpdater, Bgfs2
+from extension_LBGFS2 import Bgfs, BgfsParameterUpdater, Bgfs2
 import time
 
 
@@ -67,9 +67,9 @@ training_set, validation_set = [Dataset(tensors=t,
                                 for t in (training_tensors, validation_tensors)]
 
 input_size = training_tensors[0].shape[1]*training_tensors[0].shape[2]
-sizes = [2,10,10]
+sizes = [10,10,10]
 
-training_iter = training_set.iterator(iterator_type='sequential', batch_size=50000)
+training_iter = training_set.iterator(iterator_type='sequential', batch_size=100)
 
 image_node, label_node = training_iter.make_input_nodes()
 
@@ -124,37 +124,28 @@ for i in range(len(sizes)-1):  # repeat twice
     layers.append(AffineLayer(input_node=layers[-1],  # last element of <layers>
                               output_format=DenseFormat(axes=('b', 'f'),  # axis order: (batch, feature)
                                                         shape=(-1, sizes[i]),   # output shape: (variable batch size, 10 classes)
-                                                        dtype=None)   # don't change the input data type
+                                                        dtype=None) ,   # don't change the input data type
+                              weights = param_arrays[i*2],
+                              bias = param_arrays[i*2+1]
                               ))
-    #current_layer = layers[-1]
-    #current_layer.affine_node.linear_node.params = param_arrays[i*2]
-    #current_layer.affine_node.bias_node.params = param_arrays[i*2+1]
 
 layers.append(SoftmaxLayer(input_node=layers[-1],
                            output_format=DenseFormat(axes=('b', 'f'),  # axis order: (batch, feature)
                                                      shape=(-1, sizes[i+1]),   # output shape: (variable batch size, 10 classes)
                                                      dtype=None),      # don't change the input data type
+                           weights = param_arrays[(i+1)*2],
+                           bias = param_arrays[(i+1)*2+1]
                            ))  # collapse the channel, row, and column axes to a single feature axis
-#current_layer = layers[-1]
-#current_layer.affine_node.linear_node.params = param_arrays[(i+1)*2]
-#current_layer.affine_node.bias_node.params = param_arrays[(i+1)*2+1]
 
 softmax_layer = layers[-1]
 #correct_output = theano.tensor.scalar(dtype=theano.config.floatX)
 loss_node = CrossEntropy(softmax_layer, label_node)
 
-scalar_loss_symbol_temp = loss_node.output_symbol.mean()  # the mean over the batch axis. Very important not to use sum().
-
-replace_dict = {layers[i].affine_node.linear_node.params: param_arrays[(i-1)*2] for i in range(1,len(sizes)+1)}
-replace_dict.update({layers[i].affine_node.bias_node.params: param_arrays[(i*2)-1] for i in range(1,len(sizes)+1)})
-
-scalar_loss_symbol = theano.clone(scalar_loss_symbol_temp, replace = replace_dict)
-
+scalar_loss_symbol = loss_node.output_symbol.mean()  # the mean over the batch axis. Very important not to use sum().
 scalar_loss_symbol2 = theano.clone(scalar_loss_symbol, replace = {params_flat: params_old_flat})
 
-gradient_symbol = theano.gradient.grad(scalar_loss_symbol, params_flat) #, disconnected_inputs='ignore')
-
-gradient_symbol_old_params = theano.gradient.grad(scalar_loss_symbol2, params_old_flat) #, disconnected_inputs='ignore')
+gradient_symbol = theano.gradient.grad(scalar_loss_symbol, params_flat)
+gradient_symbol_old_params = theano.gradient.grad(scalar_loss_symbol2, params_old_flat)
 #hessian_symbol = theano.gradient.hessian(scalar_loss_symbol, params_flat)
 
 # For simplicity, we won't use Nesterov accelerated gradients for this example.
@@ -162,7 +153,7 @@ param_updater = BgfsParameterUpdater(parameters=params_flat,
                                      old_parameters=params_old_flat,
                                      gradient=gradient_symbol,
                                      gradient_at_old_params=gradient_symbol_old_params,
-                                     learning_rate=.01)
+                                     learning_rate=.3)
 
 # packages chain of nodes from the uint8 image_node up to the softmax_layer, to be saved to a file.
 model = SerializableModel([image_node], [softmax_layer])
@@ -198,15 +189,14 @@ validation_callback = ValidationCallback(inputs=[image_node.output_symbol, label
                                          input_iterator=validation_iter,
                                          monitors=[misclassification_rate_monitor])
 
-trainer = Bgfs2([image_node, label_node],
-              training_iter,
-              params_flat,
-              param_updater,
-              monitors=[],
-              training_set=training_set,
+trainer = Bgfs(inputs=[image_node, label_node],
+              parameters=params_flat,
+              old_parameters=params_old_flat,
               gradient=gradient_symbol,
-              scalar_loss_symbol=scalar_loss_symbol,
-              scalar_loss_symbol_temp=scalar_loss_symbol_temp,
+              gradient_at_old_params=gradient_symbol_old_params,
+              learning_rate=.3,
+              training_iterator=training_iter,
+              monitors=[],
               epoch_callbacks=[validation_callback,  # measure validation misclassification rate, quit if it stops falling
                                LimitsNumEpochs(100)])  # perform no more than 100 epochs
 

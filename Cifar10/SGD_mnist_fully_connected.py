@@ -17,7 +17,8 @@ from simplelearn.nodes import (Node,
                                Dropout,
                                CrossEntropy,
                                Misclassification,
-                               SoftmaxLayer)
+                               SoftmaxLayer,
+                               Lcn)
 from simplelearn.utils import safe_izip
 from simplelearn.asserts import (assert_all_greater,
                                  assert_all_less_equal,
@@ -37,35 +38,8 @@ from simplelearn.training import (SgdParameterUpdater,
                                   ValidationCallback,
                                   StopsOnStagnation,
                                   EpochLogger)
-import pdb
+#import pdb
 
-class ImageLookeupNode(Node):
-
-    def __init__(self,input_node, images_array):
-
-        self.images = images_array
-        output_symbol = self.images[input_node.output_symbol]
-        output_format = DenseFormat(axes=('b', '0', '1'),
-                                    shape=(-1, 28, 28),
-                                    dtype='uint8')
-
-        super(ImageLookeupNode, self).__init__(input_nodes=input_node,
-                                        output_symbol=output_symbol,
-                                        output_format=output_format)
-
-class LabelLookeupNode(Node):
-
-    def __init__(self,input_node, labels_array):
-
-        self.labels = labels_array
-        output_symbol = self.labels[input_node.output_symbol]
-        output_format = DenseFormat(axes=('b', ),
-                                    shape=(-1, ),
-                                    dtype='uint8')
-
-        super(LabelLookeupNode, self).__init__(input_nodes=input_node,
-                                        output_symbol=output_symbol,
-                                        output_format=output_format)
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -107,7 +81,8 @@ def parse_args():
 
     parser.add_argument("--output-prefix",
                         type=legit_prefix,
-                        required=True,
+                        required=False,
+                        default='/home/paul/output',
                         help=("Directory and optional prefix of filename to "
                               "save the log to."))
 
@@ -142,11 +117,6 @@ def parse_args():
                         type=non_negative_int,
                         default=100,
                         help="batch size")
-
-    parser.add_argument("--no-shuffle-dataset",
-                        default=False,
-                        action="store_true",
-                        help=("Shuffle the dataset before use"))
 
     parser.add_argument("--dropout-include-rates",
                         default=(1.0, 1.0, 1.0),  # i.e. no dropout
@@ -333,7 +303,13 @@ def build_fc_classifier(input_node,
             # experiments show that this converges to a higher error, and also
             # makes mnist_visualizer.py's results look very "staticky", without
             # any recognizable digit hallucinations.
-            params[indices, c] = rng.randn(num_nonzeros) / 255.0
+
+
+            # params[indices, c] = rng.randn(num_nonzeros) / 255.0
+
+        std_deviation = .05
+        params[...] = rng.standard_normal(params.shape) * std_deviation
+        shared_variable.set_value(params)
 
         shared_variable.set_value(params)
 
@@ -376,6 +352,7 @@ def main():
 
     assert_equal(sizes[-1], 10)
 
+    '''
     mnist_training, mnist_testing = load_mnist()
 
     if args.validation_size == 0:
@@ -384,10 +361,12 @@ def main():
     else:
         # split training set into training and validation sets
         tensors = mnist_training.tensors
+        size_tensors = tensors[0].shape[0]
         training_tensors = [t[:-args.validation_size, ...] for t in tensors]
-        validation_tensors = [t[-args.validation_size:, ...] for t in tensors]
+        validation_tensors = [t[size_tensors - args.validation_size:, ...] for t in tensors]
 
-        if args.no_shuffle_dataset == False:
+        shuffle_dataset = True
+        if shuffle_dataset == True:
             def shuffle_in_unison_inplace(a, b):
                 assert len(a) == len(b)
                 p = numpy.random.permutation(len(a))
@@ -395,29 +374,64 @@ def main():
 
             [training_tensors[0],training_tensors[1]] = shuffle_in_unison_inplace(training_tensors[0],training_tensors[1])
             [validation_tensors[0], validation_tensors[1]] = shuffle_in_unison_inplace(validation_tensors[0], validation_tensors[1])
+        '''
 
+    def unpickle(file):
+        import cPickle
+        fo = open(file, 'rb')
+        dict = cPickle.load(fo)
+        fo.close()
+        return dict
 
-        mnist_training = Dataset(tensors=training_tensors,
-                                 names=mnist_training.names,
-                                 formats=mnist_training.formats)
-        mnist_validation = Dataset(tensors=validation_tensors,
-                                   names=mnist_training.names,
-                                   formats=mnist_training.formats)
+    batch1 = unpickle('/home/paul/cifar-10-batches-py/data_batch_1')
+    batch2 = unpickle('/home/paul/cifar-10-batches-py/data_batch_2')
+    batch3 = unpickle('/home/paul/cifar-10-batches-py/data_batch_3')
+    batch4 = unpickle('/home/paul/cifar-10-batches-py/data_batch_4')
+    batch5 = unpickle('/home/paul/cifar-10-batches-py/data_batch_5')
 
+    training_tensors = [ numpy.concatenate((batch1['data'].reshape(10000,3,32,32), batch2['data'].reshape(10000,3,32,32), batch3['data'].reshape(10000,3,32,32), batch4['data'].reshape(10000,3,32,32) )), numpy.concatenate((batch1['labels'], batch2['labels'], batch3['labels'], batch4['labels'])) ]
+    validation_tensors = [ batch5['data'].reshape(10000,3,32,32), numpy.asarray(batch5['labels']) ]
 
+    shuffle_dataset = True
+    if shuffle_dataset == True:
+        def shuffle_in_unison_inplace(a, b):
+            assert len(a) == len(b)
+            p = numpy.random.permutation(len(a))
+            return a[p], b[p]
 
-    mnist_validation_iterator = mnist_validation.iterator(
+        [training_tensors[0],training_tensors[1]] = shuffle_in_unison_inplace(training_tensors[0],training_tensors[1])
+        [validation_tensors[0], validation_tensors[1]] = shuffle_in_unison_inplace(validation_tensors[0], validation_tensors[1])
+
+    cifar10_training = Dataset(tensors=training_tensors,
+                              names=('images', 'labels'),
+                              formats=(DenseFormat(axes=('b', 'c', '0', '1'),
+                                                  shape=(-1,3, 32, 32),
+                                                  dtype='uint8'),
+                                      DenseFormat(axes=('b',),
+                                                  shape=(-1, ),
+                                                  dtype='int64')))
+    cifar10_validation = Dataset(tensors=validation_tensors,
+                                names=('images', 'labels'),
+                                formats=(DenseFormat(axes=('b', 'c', '0', '1'),
+                                                    shape=(-1,3, 32, 32),
+                                                    dtype='uint8'),
+                                        DenseFormat(axes=('b',),
+                                                    shape=(-1, ),
+                                                    dtype='int64')))
+
+    cifar10_validation_iterator = cifar10_validation.iterator(
         iterator_type='sequential',
         batch_size=args.batch_size)
-    image_uint8_node, label_node = mnist_validation_iterator.make_input_nodes()
+    image_uint8_node, label_node = cifar10_validation_iterator.make_input_nodes()
     image_node = CastNode(image_uint8_node, 'floatX')
+    image_node_lcn = Lcn(image_node)
     # image_node = RescaleImage(image_uint8_node)
 
-    rng = numpy.random.RandomState(34523)
-    theano_rng = RandomStreams(23845)
+    rng = numpy.random.RandomState(3447523)
+    theano_rng = RandomStreams(2387345)
 
     (affine_nodes,
-     output_node) = build_fc_classifier(image_node,
+     output_node) = build_fc_classifier(image_node_lcn,
                                         sizes,
                                         sparse_init_counts,
                                         args.dropout_include_rates,
@@ -489,7 +503,7 @@ def main():
     validation_misclassification_monitor = MeanOverEpoch(
         misclassification_node,
         callbacks=[print_mcr,
-                   StopsOnStagnation(max_epochs=100,
+                   StopsOnStagnation(max_epochs=10,
                                      min_proportional_decrease=0.0)])
 
     epoch_logger.subscribe_to('validation misclassification',
@@ -524,12 +538,12 @@ def main():
 
     validation_callback = ValidationCallback(
         inputs=[image_uint8_node.output_symbol, label_node.output_symbol],
-        input_iterator=mnist_validation_iterator,
+        input_iterator=cifar10_validation_iterator,
         epoch_callbacks=[validation_loss_monitor,
                          validation_misclassification_monitor])
 
     trainer = Sgd([image_uint8_node, label_node],
-                  mnist_training.iterator(iterator_type='sequential',
+                  cifar10_training.iterator(iterator_type='sequential',
                                           batch_size=args.batch_size),
                   callbacks=(parameter_updaters +
                              momentum_updaters +

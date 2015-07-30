@@ -79,6 +79,7 @@ class BgfsParameterUpdater(object):
 
         '''
         # Try normal SGD first:
+        self.momentum = 0.5
         new_velocity = (self.momentum * self._velocity -
                         self.learning_rate * gradient)
 
@@ -88,6 +89,19 @@ class BgfsParameterUpdater(object):
                                     (self._velocity, new_velocity)])
 
         '''
+        # k is the current iteration
+        # m is how far we want to go back in history for the update
+        # s_k = x_{k+1} - x_{k}
+        # y_k = gradient_{k+1} - gradient_{k}
+        alpha = [None]*k
+
+        q.append(gradient)
+        for i in list(reversed(range(k-1,0))):
+            alpha[i] = rho[i]*(s[i].T)*q[i+1]
+            q[i] = q[i+1] - alpha[i]*y[i]
+
+        r[0] = H0 * q[0]
+
         n = parameters.get_value().shape[0]
 
 
