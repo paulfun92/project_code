@@ -39,10 +39,38 @@ from simplelearn.training import (SgdParameterUpdater,
                                   # PicklesOnEpoch,
                                   ValidationCallback,
                                   StopsOnStagnation,
-                                  EpochLogger)
+                                  EpochLogger,
+                                  EpochTimer2)
 import pdb
 from extension_semi_stochastic import SemiSgd, SemiSgdParameterUpdater
 
+class ImageLookeupNode(Node):
+
+    def __init__(self,input_node, images_array):
+
+        self.images = images_array
+        output_symbol = self.images[input_node.output_symbol]
+        output_format = DenseFormat(axes=('b', '0', '1'),
+                                    shape=(-1, 28, 28),
+                                    dtype='uint8')
+
+        super(ImageLookeupNode, self).__init__(input_nodes=input_node,
+                                        output_symbol=output_symbol,
+                                        output_format=output_format)
+
+class LabelLookeupNode(Node):
+
+    def __init__(self,input_node, labels_array):
+
+        self.labels = labels_array
+        output_symbol = self.labels[input_node.output_symbol]
+        output_format = DenseFormat(axes=('b', ),
+                                    shape=(-1, ),
+                                    dtype='uint8')
+
+        super(LabelLookeupNode, self).__init__(input_nodes=input_node,
+                                        output_symbol=output_symbol,
+                                        output_format=output_format)
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -94,7 +122,8 @@ def parse_args():
 
     parser.add_argument("--output-prefix",
                         type=legit_prefix,
-                        required=True,
+                        required=False,
+                        default='output',
                         help=("Directory and optional prefix of filename to "
                               "save the log to."))
 
@@ -130,6 +159,11 @@ def parse_args():
                         default=100,
                         help="batch size")
 
+    parser.add_argument("--batch-size-full",
+                        type=non_negative_int,
+                        default=100,
+                        help="batch size for calculating the full gradient")
+
     parser.add_argument("--no-shuffle-dataset",
                         default=False,
                         action="store_true",
@@ -149,7 +183,7 @@ def parse_args():
                               "dropout-include-rates of 0.5 0.5."))
 
     parser.add_argument("--final-momentum",
-                        type=positive_0_to_1,
+                        type=non_negative_float,
                         default=.5,  # .99 used in pylearn2 demo
                         help="Value for momentum to linearly scale up to.")
 
@@ -391,36 +425,41 @@ def main():
 
     mnist_training, mnist_testing = load_mnist()
 
-    if args.validation_size == 0:
-        # use testing set as validation set
-        mnist_validation = mnist_testing
-    else:
-        # split training set into training and validation sets
-        tensors = mnist_training.tensors
-        training_tensors = [t[:-args.validation_size, ...] for t in tensors]
-        validation_tensors = [t[-args.validation_size:, ...] for t in tensors]
+    # split training set into training and validation sets
+    tensors = mnist_training.tensors
+    training_tensors = [t[:-args.validation_size, ...] for t in tensors]
+    validation_tensors = [t[-args.validation_size:, ...] for t in tensors]
 
-        if args.no_shuffle_dataset == False:
-            def shuffle_in_unison_inplace(a, b):
-                assert len(a) == len(b)
-                p = numpy.random.permutation(len(a))
-                return a[p], b[p]
+    if args.no_shuffle_dataset == False:
+        def shuffle_in_unison_inplace(a, b):
+            assert len(a) == len(b)
+            p = numpy.random.permutation(len(a))
+            return a[p], b[p]
 
-            [training_tensors[0],training_tensors[1]] = shuffle_in_unison_inplace(training_tensors[0],training_tensors[1])
-            [validation_tensors[0], validation_tensors[1]] = shuffle_in_unison_inplace(validation_tensors[0], validation_tensors[1])
+        [training_tensors[0],training_tensors[1]] = shuffle_in_unison_inplace(training_tensors[0],training_tensors[1])
+        [validation_tensors[0], validation_tensors[1]] = shuffle_in_unison_inplace(validation_tensors[0], validation_tensors[1])
 
-        mnist_training = Dataset(tensors=training_tensors,
-                                 names=mnist_training.names,
-                                 formats=mnist_training.formats)
-        mnist_validation = Dataset(tensors=validation_tensors,
-                                   names=mnist_training.names,
-                                   formats=mnist_training.formats)
+    all_images_shared = theano.shared(numpy.vstack([training_tensors[0],validation_tensors[0]]))
+    all_labels_shared = theano.shared(numpy.concatenate([training_tensors[1],validation_tensors[1]]))
 
-    mnist_validation_iterator = mnist_validation.iterator(
-        iterator_type='sequential',
-        batch_size=args.batch_size)
-    image_uint8_node, label_node = mnist_validation_iterator.make_input_nodes()
-    image_node = CastNode(image_uint8_node, 'floatX')
+    length_training = training_tensors[0].shape[0]
+    length_validation = validation_tensors[0].shape[0]
+    indices_training = numpy.asarray(range(length_training))
+    indices_validation = numpy.asarray(range(length_training, length_training + length_validation))
+    indices_training_dataset = Dataset( tensors=[indices_training], names=['indices'], formats=[DenseFormat(axes=['b'],shape=[-1],dtype='int64')] )
+    indices_validation_dataset = Dataset( tensors=[indices_validation], names=['indices'], formats=[DenseFormat(axes=['b'],shape=[-1],dtype='int64')] )
+    indices_training_iterator = indices_training_dataset.iterator(iterator_type='sequential',batch_size=args.batch_size)
+    indices_validation_iterator = indices_validation_dataset.iterator(iterator_type='sequential',batch_size=10000)
+    training_iterator_full = indices_training_dataset.iterator(iterator_type='sequential',batch_size=args.batch_size_full)
+
+    mnist_validation_iterator = indices_validation_iterator
+    mnist_training_iterator = indices_training_iterator
+
+    input_indices_symbolic, = indices_training_iterator.make_input_nodes()
+    image_lookup_node = ImageLookeupNode(input_indices_symbolic, all_images_shared)
+    label_lookup_node = LabelLookeupNode(input_indices_symbolic, all_labels_shared)
+
+    image_node = CastNode(image_lookup_node, 'floatX')
     # image_node = RescaleImage(image_uint8_node)
 
     rng = numpy.random.RandomState(34523)
@@ -434,7 +473,7 @@ def main():
                                         rng,
                                         theano_rng)
 
-    loss_node = CrossEntropy(output_node, label_node)
+    loss_node = CrossEntropy(output_node, label_lookup_node)
     loss_sum = loss_node.output_symbol.mean()
     max_epochs = 10000
 
@@ -456,7 +495,6 @@ def main():
     #
     # Makes parameter updaters
     #
-    training_iterator = mnist_training.iterator(iterator_type='sequential',batch_size=args.batch_size)
 
     parameter_updaters = []
     all_gradients = []
@@ -471,7 +509,8 @@ def main():
                                                     args.learning_rate,
                                                     args.initial_momentum,
                                                     args.method,
-                                                    training_iterator,
+                                                    mnist_training_iterator,
+                                                    training_iterator_full,
                                                     args.nesterov)
             parameter_updaters.append(parameter_updater)
 
@@ -509,7 +548,7 @@ def main():
     # mcr_logger = LogsToLists()
     # training_stopper = StopsOnStagnation(max_epochs=10,
     #                                      min_proportional_decrease=0.0)
-    misclassification_node = Misclassification(output_node, label_node)
+    misclassification_node = Misclassification(output_node, label_lookup_node)
 
     validation_loss_monitor = MeanOverEpoch(loss_node, callbacks=[])
     epoch_logger.subscribe_to('validation mean loss', validation_loss_monitor)
@@ -533,6 +572,9 @@ def main():
     epoch_logger.subscribe_to('training misclassification %',
                               training_misclassification_monitor)
 
+    epoch_timer = EpochTimer2()
+    epoch_logger.subscribe_to('epoch duration', epoch_timer)
+
     # epoch callbacks
     # validation_loss_logger = LogsToLists()
 
@@ -541,7 +583,7 @@ def main():
         basename = make_output_basename(args)
         return "{}{}.pkl".format(basename, '_best' if best else "")
 
-    model = SerializableModel([image_uint8_node], [output_node])
+    model = SerializableModel([input_indices_symbolic], [output_node])
     saves_best = SavesAtMinimum(model, make_output_filename(args, best=True))
 
     validation_loss_monitor = MeanOverEpoch(
@@ -551,23 +593,24 @@ def main():
     epoch_logger.subscribe_to('validation loss', validation_loss_monitor)
 
     validation_callback = ValidationCallback(
-        inputs=[image_uint8_node.output_symbol, label_node.output_symbol],
+        inputs=[input_indices_symbolic.output_symbol],
         input_iterator=mnist_validation_iterator,
         epoch_callbacks=[validation_loss_monitor,
                          validation_misclassification_monitor])
 
-    trainer = SemiSgd([image_uint8_node, label_node],
-                    training_iterator,
+    trainer = SemiSgd([input_indices_symbolic],
+                    mnist_training_iterator,
                     parameters,
                     old_param_symbols,
                     parameter_updaters,
-                  epoch_callbacks=(parameter_updaters +
+                    training_iterator_full,
+                    epoch_callbacks=(parameter_updaters +
                              momentum_updaters +
                              [training_loss_monitor,
                               training_misclassification_monitor,
                               validation_callback,
                               LimitsNumEpochs(max_epochs),
-                              EpochTimer()]))
+                              epoch_timer]))
                                                    # validation_loss_monitor]))
 
     # stuff_to_pickle = OrderedDict(

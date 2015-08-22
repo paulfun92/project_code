@@ -4,6 +4,8 @@ import os
 import argparse
 import numpy
 import theano
+import time
+import timeit
 from theano.tensor.shared_randomstreams import RandomStreams
 from nose.tools import (assert_true,
                         assert_is_instance,
@@ -35,7 +37,9 @@ from simplelearn.training import (Sgd,
                                   # PicklesOnEpoch,
                                   ValidationCallback,
                                   StopsOnStagnation,
-                                  EpochLogger)
+                                  EpochLogger,
+                                  EpochCallback,
+                                  EpochTimer2)
 import pdb
 from RMSprop_extensions import RMSpropSgdParameterUpdater
 
@@ -154,6 +158,56 @@ def parse_args():
                               "use the MNIST test set as the validation set."))
 
     return parser.parse_args()
+
+class ImageLookeupNode(Node):
+
+    def __init__(self,input_node, images_array):
+
+        self.images = images_array
+        output_symbol = self.images[input_node.output_symbol]
+        output_format = DenseFormat(axes=('b', '0', '1'),
+                                    shape=(-1, 28, 28),
+                                    dtype='uint8')
+
+        super(ImageLookeupNode, self).__init__(input_nodes=input_node,
+                                        output_symbol=output_symbol,
+                                        output_format=output_format)
+
+class LabelLookeupNode(Node):
+
+    def __init__(self,input_node, labels_array):
+
+        self.labels = labels_array
+        output_symbol = self.labels[input_node.output_symbol]
+        output_format = DenseFormat(axes=('b', ),
+                                    shape=(-1, ),
+                                    dtype='uint8')
+
+        super(LabelLookeupNode, self).__init__(input_nodes=input_node,
+                                        output_symbol=output_symbol,
+                                        output_format=output_format)
+
+class EpochTimer(EpochCallback):
+    '''
+    Prints the epoch number and duration after each epoch.
+    '''
+
+    def __init__(self):
+        self.start_time = None
+        self.epoch_number = None
+
+    def on_start_training(self):
+        self.start_time = timeit.default_timer()
+        self.epoch_number = 0
+
+    def on_epoch(self):
+        end_time = timeit.default_timer()
+
+        print("Epoch {} duration: {}".format(self.epoch_number,
+                                             end_time - self.start_time))
+
+        self.start_time = end_time
+        self.epoch_number += 1
 
 
 def build_fc_classifier(input_node,
@@ -351,36 +405,40 @@ def main():
 
     mnist_training, mnist_testing = load_mnist()
 
-    if args.validation_size == 0:
-        # use testing set as validation set
-        mnist_validation = mnist_testing
-    else:
-        # split training set into training and validation sets
-        tensors = mnist_training.tensors
-        training_tensors = [t[:-args.validation_size, ...] for t in tensors]
-        validation_tensors = [t[-args.validation_size:, ...] for t in tensors]
+    # split training set into training and validation sets
+    tensors = mnist_training.tensors
+    training_tensors = [t[:-args.validation_size, ...] for t in tensors]
+    validation_tensors = [t[-args.validation_size:, ...] for t in tensors]
 
-        if args.no_shuffle_dataset == False:
-            def shuffle_in_unison_inplace(a, b):
-                assert len(a) == len(b)
-                p = numpy.random.permutation(len(a))
-                return a[p], b[p]
+    if args.no_shuffle_dataset == False:
+        def shuffle_in_unison_inplace(a, b):
+            assert len(a) == len(b)
+            p = numpy.random.permutation(len(a))
+            return a[p], b[p]
 
-            [training_tensors[0],training_tensors[1]] = shuffle_in_unison_inplace(training_tensors[0],training_tensors[1])
-            [validation_tensors[0], validation_tensors[1]] = shuffle_in_unison_inplace(validation_tensors[0], validation_tensors[1])
+        [training_tensors[0],training_tensors[1]] = shuffle_in_unison_inplace(training_tensors[0],training_tensors[1])
+        [validation_tensors[0], validation_tensors[1]] = shuffle_in_unison_inplace(validation_tensors[0], validation_tensors[1])
 
-        mnist_training = Dataset(tensors=training_tensors,
-                                 names=mnist_training.names,
-                                 formats=mnist_training.formats)
-        mnist_validation = Dataset(tensors=validation_tensors,
-                                   names=mnist_training.names,
-                                   formats=mnist_training.formats)
+    all_images_shared = theano.shared(numpy.vstack([training_tensors[0],validation_tensors[0]]))
+    all_labels_shared = theano.shared(numpy.concatenate([training_tensors[1],validation_tensors[1]]))
 
-    mnist_validation_iterator = mnist_validation.iterator(
-        iterator_type='sequential',
-        batch_size=args.batch_size)
-    image_uint8_node, label_node = mnist_validation_iterator.make_input_nodes()
-    image_node = CastNode(image_uint8_node, 'floatX')
+    length_training = training_tensors[0].shape[0]
+    length_validation = validation_tensors[0].shape[0]
+    indices_training = numpy.asarray(range(length_training))
+    indices_validation = numpy.asarray(range(length_training, length_training + length_validation))
+    indices_training_dataset = Dataset( tensors=[indices_training], names=['indices'], formats=[DenseFormat(axes=['b'],shape=[-1],dtype='int64')] )
+    indices_validation_dataset = Dataset( tensors=[indices_validation], names=['indices'], formats=[DenseFormat(axes=['b'],shape=[-1],dtype='int64')] )
+    indices_training_iterator = indices_training_dataset.iterator(iterator_type='sequential',batch_size=args.batch_size)
+    indices_validation_iterator = indices_validation_dataset.iterator(iterator_type='sequential',batch_size=args.batch_size)
+
+    mnist_validation_iterator = indices_validation_iterator
+    mnist_training_iterator = indices_training_iterator
+
+    input_indices_symbolic, = indices_training_iterator.make_input_nodes()
+    image_lookup_node = ImageLookeupNode(input_indices_symbolic, all_images_shared)
+    label_lookup_node = LabelLookeupNode(input_indices_symbolic, all_labels_shared)
+
+    image_node = CastNode(image_lookup_node, 'floatX')
     # image_node = RescaleImage(image_uint8_node)
 
     rng = numpy.random.RandomState(34523)
@@ -394,7 +452,7 @@ def main():
                                         rng,
                                         theano_rng)
 
-    loss_node = CrossEntropy(output_node, label_node)
+    loss_node = CrossEntropy(output_node, label_lookup_node)
     loss_sum = loss_node.output_symbol.mean()
     max_epochs = 10000
 
@@ -443,7 +501,7 @@ def main():
     # mcr_logger = LogsToLists()
     # training_stopper = StopsOnStagnation(max_epochs=10,
     #                                      min_proportional_decrease=0.0)
-    misclassification_node = Misclassification(output_node, label_node)
+    misclassification_node = Misclassification(output_node, label_lookup_node)
 
     validation_loss_monitor = MeanOverEpoch(loss_node, callbacks=[])
     epoch_logger.subscribe_to('validation mean loss', validation_loss_monitor)
@@ -475,7 +533,7 @@ def main():
         basename = make_output_basename(args)
         return "{}{}.pkl".format(basename, '_best' if best else "")
 
-    model = SerializableModel([image_uint8_node], [output_node])
+    model = SerializableModel([input_indices_symbolic], [output_node])
     saves_best = SavesAtMinimum(model, make_output_filename(args, best=True))
 
     validation_loss_monitor = MeanOverEpoch(
@@ -484,20 +542,23 @@ def main():
 
     epoch_logger.subscribe_to('validation loss', validation_loss_monitor)
 
+    epoch_timer = EpochTimer2()
+    epoch_logger.subscribe_to('epoch duration', epoch_timer)
+
     validation_callback = ValidationCallback(
-        inputs=[image_uint8_node.output_symbol, label_node.output_symbol],
+        inputs=[input_indices_symbolic.output_symbol],
         input_iterator=mnist_validation_iterator,
         epoch_callbacks=[validation_loss_monitor,
                          validation_misclassification_monitor])
 
-    trainer = Sgd([image_uint8_node, label_node],
-                  mnist_training.iterator(iterator_type='sequential',
-                                          batch_size=args.batch_size),
+    trainer = Sgd([input_indices_symbolic],
+                  mnist_training_iterator,
                   callbacks=(parameter_updaters +
                              [training_loss_monitor,
                               training_misclassification_monitor,
                               validation_callback,
-                              LimitsNumEpochs(max_epochs)]))
+                              LimitsNumEpochs(max_epochs),
+                              epoch_timer]))
                                                    # validation_loss_monitor]))
 
     # stuff_to_pickle = OrderedDict(
@@ -517,7 +578,10 @@ def main():
     #                              validation_callback,
     #                              LimitsNumEpochs(max_epochs)])
 
+    start_time = time.time()
     trainer.train()
+    elapsed_time = time.time() - start_time
+    print("Total elapsed time is for training is: ", elapsed_time)
 
 
 if __name__ == '__main__':

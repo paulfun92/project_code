@@ -49,7 +49,8 @@ from simplelearn.training import (SgdParameterUpdater,
                                   PicklesOnEpoch,
                                   ValidationCallback,
                                   StopsOnStagnation,
-                                  EpochLogger)
+                                  EpochLogger,
+                                  EpochTimer2)
 #from GD_extensions import Gd
 
 class ImageLookeupNode(Node):
@@ -520,7 +521,7 @@ def main():
             weight_loss = args.weight_decay * theano.tensor.sqr(weights).sum()
             scalar_loss = scalar_loss + weight_loss
 
-    max_epochs = 500
+    max_epochs = 205
 
     #
     # Makes parameter updaters
@@ -626,7 +627,7 @@ def main():
     validation_loss_monitor = MeanOverEpoch(loss_node, callbacks=[])
     epoch_logger.subscribe_to('validation mean loss', validation_loss_monitor)
 
-    training_stopper = StopsOnStagnation(max_epochs=100,
+    training_stopper = StopsOnStagnation(max_epochs=210,
                                              min_proportional_decrease=0.0)
     validation_misclassification_monitor = MeanOverEpoch(misclassification_node,
                                              callbacks=[print_misclassification_rate,
@@ -646,7 +647,8 @@ def main():
     epoch_logger.subscribe_to('training misclassification %',
                               training_misclassification_monitor)
 
-    epoch_timer = EpochTimer()
+    epoch_timer = EpochTimer2()
+    epoch_logger.subscribe_to('epoch duration', epoch_timer)
 #    epoch_logger.subscribe_to('epoch time',
  #                             epoch_timer)
     #################
@@ -692,8 +694,8 @@ def main():
                                  LimitsNumEpochs(max_epochs)])
     '''
     trainer.epoch_callbacks += (momentum_updaters +
-                                [epoch_timer,
-                                 LimitsNumEpochs(max_epochs)])
+                                [LimitsNumEpochs(max_epochs),
+                                 epoch_timer])
 
     start_time = time.time()
     trainer.train()

@@ -21,7 +21,8 @@ from simplelearn.nodes import (Conv2dLayer,
                                SoftmaxLayer,
                                RescaleImage,
                                FormatNode,
-                               AffineLayer)
+                               AffineLayer,
+                               RescaleImage)
 from simplelearn.utils import safe_izip
 from simplelearn.asserts import (assert_floating,
                                  assert_all_equal,
@@ -45,6 +46,56 @@ from simplelearn.training import (SgdParameterUpdater,
                                   StopsOnStagnation,
                                   EpochLogger)
 from extension_LBGFS2 import Bgfs
+
+class ImageLookeupNode(Node):
+
+    def __init__(self,input_node, images_array):
+
+        self.images = images_array
+        output_symbol = self.images[input_node.output_symbol]
+        output_format = DenseFormat(axes=('b', '0', '1'),
+                                    shape=(-1, 28, 28),
+                                    dtype='uint8')
+
+        super(ImageLookeupNode, self).__init__(input_nodes=input_node,
+                                        output_symbol=output_symbol,
+                                        output_format=output_format)
+
+class LabelLookeupNode(Node):
+
+    def __init__(self,input_node, labels_array):
+
+        self.labels = labels_array
+        output_symbol = self.labels[input_node.output_symbol]
+        output_format = DenseFormat(axes=('b', ),
+                                    shape=(-1, ),
+                                    dtype='uint8')
+
+        super(LabelLookeupNode, self).__init__(input_nodes=input_node,
+                                        output_symbol=output_symbol,
+                                        output_format=output_format)
+
+class EpochTimer(EpochCallback):
+    '''
+    Prints the epoch number and duration after each epoch.
+    '''
+
+    def __init__(self):
+        self.start_time = None
+        self.epoch_number = None
+
+    def on_start_training(self):
+        self.start_time = timeit.default_timer()
+        self.epoch_number = 0
+
+    def on_epoch(self):
+        end_time = timeit.default_timer()
+
+        print("Epoch {} duration: {}".format(self.epoch_number,
+                                             end_time - self.start_time))
+
+        self.start_time = end_time
+        self.epoch_number += 1
 
 ###### HERE IS THE MAIN EXAMPLE ##########
 
@@ -200,8 +251,11 @@ trainer = Bgfs(inputs=[image_node, label_node],
               gradient=gradient_symbol,
               learning_rate=.3,
               training_iterator=training_iter,
+              training_set=training_set,
+              scalar_loss=scalar_loss_symbol,
               epoch_callbacks=[validation_callback,  # measure validation misclassification rate, quit if it stops falling
-                               LimitsNumEpochs(1000)])  # perform no more than 100 epochs
+                               LimitsNumEpochs(1000),
+                               EpochTimer()])  # perform no more than 100 epochs
 
 start_time = time.time()
 trainer.train()

@@ -47,7 +47,8 @@ from simplelearn.training import (SgdParameterUpdater,
                                   LinearlyInterpolatesOverEpochs,
                                   PicklesOnEpoch,
                                   ValidationCallback,
-                                  StopsOnStagnation)
+                                  StopsOnStagnation,
+                                  EpochTimer2)
 
 
 def parse_args():
@@ -221,6 +222,7 @@ def build_conv_classifier(input_node,
                           affine_output_sizes,
                           affine_init_stddevs,
                           dropout_include_rates,
+                          conv_pads,
                           rng,
                           theano_rng):
     '''
@@ -293,13 +295,15 @@ def build_conv_classifier(input_node,
          pool_shape,
          pool_stride,
          pool_pad,
-         conv_dropout_include_rate) in safe_izip(filter_shapes,
-                                                 filter_counts,
-                                                 filter_init_uniform_ranges,
-                                                 pool_shapes,
-                                                 pool_strides,
-                                                 pool_pads,
-                                                 conv_dropout_include_rates):
+         conv_dropout_include_rate,
+         conv_pad)      in safe_izip(filter_shapes,
+                                     filter_counts,
+                                     filter_init_uniform_ranges,
+                                     pool_shapes,
+                                     pool_strides,
+                                     pool_pads,
+                                     conv_dropout_include_rates,
+                                     conv_pads):
         if conv_dropout_include_rate != 1.0:
             last_node = Dropout(last_node,
                                 conv_dropout_include_rate,
@@ -308,7 +312,7 @@ def build_conv_classifier(input_node,
         last_node = Conv2dLayer(last_node,
                                 filter_shape,
                                 filter_count,
-                                conv_pads='valid',
+                                conv_pads=conv_pad,
                                 pool_window_shape=pool_shape,
                                 pool_strides=pool_stride,
                                 pool_pads='pylearn2')
@@ -395,16 +399,18 @@ def main():
     # In pylearn2/scripts/tutorials/convolutional_network/:
     #   convolutional_network.ipynb
 
-    filter_counts = [96, 192]
+    filter_counts = [96, 192, 192]
     filter_init_uniform_ranges = [0.005]* len(filter_counts)
-    filter_shapes = [(8, 8), (5, 5)]
-    pool_shapes = [(4, 4), (4, 4)]
-    pool_strides = [(2, 2), (2, 2)]
-    pool_pads = [(3,3), (3,3)]
+    filter_shapes = [(8, 8), (8,8), (5, 5)]
+    pool_shapes = [(4, 4),(4, 4), (2, 2)]
+    pool_strides = [(2, 2), (2, 2), (2,2)]
+    pool_pads = [(2,2), (2,2), (2,2)]
     affine_output_sizes = [10]
     affine_init_stddevs = [.005] * len(affine_output_sizes)
-    dropout_include_rates = ([.8 if args.dropout else 1.0] *
-                             (len(filter_counts) + len(affine_output_sizes)))
+    dropout_include_rates = [0.8, 0.5, 0.5, 0.5]
+    #dropout_include_rates = ([.8 if args.dropout else 1.0] *
+    #                         (len(filter_counts) + len(affine_output_sizes)))
+    conv_pads = [(4, 4), (3, 3), (3, 3)]
 
     assert_equal(affine_output_sizes[-1], 10)
 
@@ -475,6 +481,7 @@ def main():
                                           affine_output_sizes,
                                           affine_init_stddevs,
                                           dropout_include_rates,
+                                          conv_pads,
                                           rng,
                                           theano_rng)
 
@@ -645,12 +652,12 @@ def main():
     #      ('model', model)))
 
     trainer.epoch_callbacks += (momentum_updaters +
-                                [EpochTimer(),
-                                 PicklesOnEpoch(stuff_to_pickle,
+                                [PicklesOnEpoch(stuff_to_pickle,
                                                 make_output_filename(args),
                                                 overwrite=False),
                                  validation_callback,
-                                 LimitsNumEpochs(max_epochs)])
+                                 LimitsNumEpochs(max_epochs),
+                                 epoch_timer])
 
     trainer.train()
 

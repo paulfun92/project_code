@@ -3,6 +3,8 @@
 import os
 import argparse
 import numpy
+import timeit
+import time
 import theano
 from theano.tensor.shared_randomstreams import RandomStreams
 from nose.tools import (assert_true,
@@ -36,7 +38,10 @@ from simplelearn.training import (SgdParameterUpdater,
                                   # PicklesOnEpoch,
                                   ValidationCallback,
                                   StopsOnStagnation,
-                                  EpochLogger)
+                                  EpochLogger,
+                                  EpochCallback,
+                                  ReduceOverEpoch,
+                                  EpochTimer2)
 import pdb
 
 class ImageLookeupNode(Node):
@@ -107,7 +112,8 @@ def parse_args():
 
     parser.add_argument("--output-prefix",
                         type=legit_prefix,
-                        required=True,
+                        required=False,
+                        default='output',
                         help=("Directory and optional prefix of filename to "
                               "save the log to."))
 
@@ -149,7 +155,7 @@ def parse_args():
                         help=("Shuffle the dataset before use"))
 
     parser.add_argument("--dropout-include-rates",
-                        default=(1.0, 1.0, 1.0),  # i.e. no dropout
+                        default=(1.0, 1.0, 1.0, 1.0),  # i.e. no dropout
                         type=positive_0_to_1,
                         nargs=3,
                         help=("The dropout include rates for the outputs of "
@@ -162,7 +168,7 @@ def parse_args():
                               "dropout-include-rates of 0.5 0.5."))
 
     parser.add_argument("--final-momentum",
-                        type=positive_0_to_1,
+                        type=non_negative_float,
                         default=.5,  # .99 used in pylearn2 demo
                         help="Value for momentum to linearly scale up to.")
 
@@ -181,6 +187,28 @@ def parse_args():
                               "use the MNIST test set as the validation set."))
 
     return parser.parse_args()
+
+class EpochTimer(EpochCallback):
+    '''
+    Prints the epoch number and duration after each epoch.
+    '''
+
+    def __init__(self):
+        self.start_time = None
+        self.epoch_number = None
+
+    def on_start_training(self):
+        self.start_time = timeit.default_timer()
+        self.epoch_number = 0
+
+    def on_epoch(self):
+        end_time = timeit.default_timer()
+
+        print("Epoch {} duration: {}".format(self.epoch_number,
+                                             end_time - self.start_time))
+
+        self.start_time = end_time
+        self.epoch_number += 1
 
 
 def build_fc_classifier(input_node,
@@ -370,8 +398,8 @@ def main():
     #   multilayer_perceptron.ipynb
     #   mlp_tutorial_part_3.yaml
 
-    sizes = [500, 500, 10]
-    sparse_init_counts = [15, 15]
+    sizes = [500, 500, 500, 10]
+    sparse_init_counts = [15, 15, 15]
     assert_equal(len(sparse_init_counts), len(sizes) - 1)
 
     assert_equal(sizes[-1], 10)
@@ -491,7 +519,7 @@ def main():
     validation_misclassification_monitor = MeanOverEpoch(
         misclassification_node,
         callbacks=[print_mcr,
-                   StopsOnStagnation(max_epochs=100,
+                   StopsOnStagnation(max_epochs=300,
                                      min_proportional_decrease=0.0)])
 
     epoch_logger.subscribe_to('validation misclassification',
@@ -524,6 +552,10 @@ def main():
 
     epoch_logger.subscribe_to('validation loss', validation_loss_monitor)
 
+    epoch_timer = EpochTimer2()
+    epoch_logger.subscribe_to('epoch duration', epoch_timer)
+
+
     validation_callback = ValidationCallback(
         inputs=[input_indices_symbolic.output_symbol],
         input_iterator=mnist_validation_iterator,
@@ -537,7 +569,8 @@ def main():
                              [training_loss_monitor,
                               training_misclassification_monitor,
                               validation_callback,
-                              LimitsNumEpochs(max_epochs)]))
+                              LimitsNumEpochs(max_epochs),
+                              epoch_timer]))
                                                    # validation_loss_monitor]))
 
     # stuff_to_pickle = OrderedDict(
@@ -557,7 +590,10 @@ def main():
     #                              validation_callback,
     #                              LimitsNumEpochs(max_epochs)])
 
+    start_time = time.time()
     trainer.train()
+    elapsed_time = time.time() - start_time
+    print("Total elapsed time is for training is: ", elapsed_time)
 
 
 if __name__ == '__main__':
